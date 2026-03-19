@@ -572,7 +572,33 @@ case "$CMD" in
   export)                   cmd_export  "${1:-}" ;;
   import)                   cmd_import  "$@" ;;
   version|-V|--version)     printf "pvesearchin v%s\n" "$VERSION"; exit 0 ;;
-  -h|--help|help)           banner; echo; usage_main; exit 0 ;;
+  -h|--help)                banner; echo; usage_main; exit 0 ;;
+  help)
+    # "pvesearchin help"              → ayuda general
+    # "pvesearchin help <subcomando>" → ayuda del subcomando
+    if [[ $# -gt 0 ]]; then
+      case "${1}" in
+        search)                   banner; echo; usage_search; exit 0 ;;
+        add)                      banner; echo; usage_add;    exit 0 ;;
+        remove|rm|delete)
+          printf "\n${BOLD}Uso:${RST}\n  pvesearchin remove <hostname>\n\n"
+          printf "Elimina un servidor del listado configurado.\n\n"; exit 0 ;;
+        edit|update)              banner; echo; usage_edit;   exit 0 ;;
+        list|ls)
+          printf "\n${BOLD}Uso:${RST}\n  pvesearchin list\n\n"
+          printf "Muestra todos los servidores Proxmox configurados.\n\n"; exit 0 ;;
+        export)
+          printf "\n${BOLD}Uso:${RST}\n  pvesearchin export [archivo]\n\n"
+          printf "Sin archivo imprime en stdout. Con archivo guarda el listado.\n\n"; exit 0 ;;
+        import)                   banner; echo; usage_import; exit 0 ;;
+        version)
+          printf "\n${BOLD}Uso:${RST}\n  pvesearchin version\n\n"
+          printf "Muestra la versión instalada.\n\n"; exit 0 ;;
+        *) err "Comando no reconocido: ${1}"; echo; usage_main; exit 2 ;;
+      esac
+    fi
+    banner; echo; usage_main; exit 0
+    ;;
   # Cualquier otra cosa se interpreta como búsqueda directa
   *)                        cmd_search  "$CMD" "$@" ;;
 esac
