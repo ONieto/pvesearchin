@@ -1,22 +1,37 @@
 #!/usr/bin/env bash
+#
 # pvesearchin — Proxmox VM/CT Search
-# Busca VMs y CTs por nombre o VMID en múltiples nodos Proxmox.
+#
+# Busca, lista e inspecciona VMs y CTs en múltiples nodos Proxmox VE.
 # Gestiona el listado de servidores en ~/.config/pvesearchin/servers
-# Repo: https://github.com/ONieto/pvesearchin
-# Requiere: bash 4+, ssh
+# mediante llaves SSH sin contraseña.
+#
+# Uso:
+#   pvesearchin <comando> [opciones]
+#   pvesearchin <nombre|vmid>          # búsqueda directa
+#
+# Dependencias: bash 4+, ssh, qm, pct, pveversion (en cada nodo Proxmox)
+# Repo:         https://github.com/ONieto/pvesearchin
+# Estándar:     Google Shell Style Guide (https://google.github.io/styleguide/shellguide.html)
 
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="1.0.0"
-CONFIG_DIR="${HOME}/.config/pvesearchin"
-CONFIG_FILE="${CONFIG_DIR}/servers"
-DEFAULT_USER="root"
-DEFAULT_PORT="22"
+# ======================= CONSTANTES GLOBALES ==========================
+readonly VERSION="1.1.0"
+readonly CONFIG_DIR="${HOME}/.config/pvesearchin"
+readonly CONFIG_FILE="${CONFIG_DIR}/servers"
+readonly DEFAULT_USER="root"
+readonly DEFAULT_PORT="22"
+readonly HR="────────────────────────────────────────────────────────────────────────"
 
 # ======================= ESTILO ==========================
-HR="────────────────────────────────────────────────────────────────────────"
-
+# supports_color
+#
+# Comprueba si el terminal activo soporta al menos 8 colores.
+#
+# Returns:
+#   0 si hay soporte de color, 1 en caso contrario.
 supports_color() {
   [[ -t 1 ]] || return 1
   command -v tput >/dev/null 2>&1 || return 1
@@ -27,10 +42,10 @@ supports_color() {
 if supports_color; then
   BOLD="$(printf '\033[1m')"; DIM="$(printf '\033[2m')"
   RED="$(printf '\033[31m')";  GRN="$(printf '\033[32m')"; YLW="$(printf '\033[33m')"
-  BLU="$(printf '\033[34m')";  CYN="$(printf '\033[36m')"
+  BLU="$(printf '\033[34m')";  CYN="$(printf '\033[36m')"; MAG="$(printf '\033[35m')"
   RST="$(printf '\033[0m')"
 else
-  BOLD=""; DIM=""; RED=""; GRN=""; YLW=""; BLU=""; CYN=""; RST=""
+  BOLD=""; DIM=""; RED=""; GRN=""; YLW=""; BLU=""; CYN=""; MAG=""; RST=""
 fi
 
 hr()   { printf "%b\n" "${DIM}${HR}${RST}"; }
@@ -52,22 +67,232 @@ ASCII
   printf "%b\n" "${DIM}       Proxmox VM/CT Search — v${VERSION}${RST}"
 }
 
+# ======================= SSH BASE ==========================
+SSH_BASE_OPTS=(
+  -o StrictHostKeyChecking=no
+  -o BatchMode=yes
+  -o PasswordAuthentication=no
+  -o LogLevel=ERROR
+)
+
 # ======================= CONFIG ==========================
+# ensure_config
+#
+# Crea el directorio y archivo de configuración si no existen.
 ensure_config() {
   mkdir -p "$CONFIG_DIR"
   [[ -f "$CONFIG_FILE" ]] || touch "$CONFIG_FILE"
 }
 
-# Lee servidores del config (ignora comentarios y líneas vacías)
-# Devuelve líneas: hostname:port:user
+# read_servers
+#
+# Lee el archivo de configuración e imprime las entradas activas.
+# Ignora comentarios (líneas con #) y líneas vacías.
+#
+# Outputs:
+#   Líneas con formato hostname:puerto:usuario a stdout.
 read_servers() {
   [[ -f "$CONFIG_FILE" ]] || return 0
   grep -v '^\s*#' "$CONFIG_FILE" | grep -v '^\s*$' || true
 }
 
+# server_exists
+#
+# Comprueba si un hostname ya existe en la configuración.
+#
+# Args:
+#   $1 - Hostname a buscar.
+#
+# Returns:
+#   0 si existe, 1 si no existe.
 server_exists() {
   local host="$1"
   read_servers | awk -F: '{print $1}' | grep -qx "$host" 2>/dev/null
+}
+
+# get_target_entries
+#
+# Devuelve entradas del config, opcionalmente filtradas por hostname.
+# Si se pasa un hostname que no existe, termina con error.
+#
+# Args:
+#   $1 - (opcional) Hostname a filtrar.
+#
+# Outputs:
+#   Líneas hostname:puerto:usuario a stdout.
+get_target_entries() {
+  local host_filter="${1:-}"
+  if [[ -n "$host_filter" ]]; then
+    if ! server_exists "$host_filter"; then
+      err "El servidor ${BOLD}${host_filter}${RST} no está en la lista."
+      info "Servidores disponibles: ${BOLD}pvesearchin list${RST}"
+      exit 1
+    fi
+    read_servers | grep "^${host_filter}:"
+  else
+    read_servers
+  fi
+}
+
+# ======================= TABLA COMPARTIDA VM/CT ==========================
+# Las funciones de exploración acumulan resultados en estos arrays
+# globales y luego invocan render_vmct_table para presentarlos.
+declare -a G_SERVER=()
+declare -a G_VMID=()
+declare -a G_NAME=()
+declare -a G_TYPE=()
+declare -a G_STATUS=()
+declare -a G_EXTRA=()   # columna extra opcional (ej: días sin cambios en orphans)
+
+# reset_results
+#
+# Vacía todos los arrays globales de resultados.
+reset_results() {
+  G_SERVER=(); G_VMID=(); G_NAME=(); G_TYPE=(); G_STATUS=(); G_EXTRA=()
+}
+
+# render_vmct_table
+#
+# Imprime la tabla de resultados acumulados en los arrays G_*.
+# Los anchos de columna se calculan dinámicamente según el contenido.
+#
+# Args:
+#   $1 - (opcional) Título de la columna extra (usa G_EXTRA[]).
+#
+# Outputs:
+#   Tabla formateada con colores a stdout.
+# render_vmct_table [nombre_col_extra]
+render_vmct_table() {
+  local extra_hdr="${1:-}"
+  local found=${#G_VMID[@]}
+
+  if (( found == 0 )); then
+    return 1
+  fi
+
+  local W_SRV=8 W_VMID=4 W_NAME=6 W_TYPE=4 W_ST=6 W_EX=0
+  [[ -n "$extra_hdr" ]] && W_EX=${#extra_hdr}
+
+  for i in "${!G_VMID[@]}"; do
+    [[ ${#G_SERVER[$i]} -gt $W_SRV  ]] && W_SRV=${#G_SERVER[$i]}
+    [[ ${#G_VMID[$i]}   -gt $W_VMID ]] && W_VMID=${#G_VMID[$i]}
+    [[ ${#G_NAME[$i]}   -gt $W_NAME ]] && W_NAME=${#G_NAME[$i]}
+    [[ ${#G_TYPE[$i]}   -gt $W_TYPE ]] && W_TYPE=${#G_TYPE[$i]}
+    [[ ${#G_STATUS[$i]} -gt $W_ST   ]] && W_ST=${#G_STATUS[$i]}
+    if [[ -n "$extra_hdr" && ${#G_EXTRA[$i]:-0} -gt $W_EX ]]; then
+      W_EX=${#G_EXTRA[$i]}
+    fi
+  done
+
+  local sep_srv;  sep_srv="$(printf  '─%.0s' $(seq 1 $W_SRV))"
+  local sep_vmid; sep_vmid="$(printf '─%.0s' $(seq 1 $W_VMID))"
+  local sep_name; sep_name="$(printf '─%.0s' $(seq 1 $W_NAME))"
+  local sep_type; sep_type="$(printf '─%.0s' $(seq 1 $W_TYPE))"
+  local sep_st;   sep_st="$(printf   '─%.0s' $(seq 1 $W_ST))"
+
+  if [[ -n "$extra_hdr" ]]; then
+    local sep_ex; sep_ex="$(printf '─%.0s' $(seq 1 $W_EX))"
+    printf "   %b%-${W_SRV}s  %-${W_VMID}s  %-${W_NAME}s  %-${W_TYPE}s  %-${W_ST}s  %-${W_EX}s%b\n" \
+      "${BOLD}" "SERVIDOR" "VMID" "NOMBRE" "TIPO" "ESTADO" "$extra_hdr" "${RST}"
+    printf "   ${DIM}%s  %s  %s  %s  %s  %s${RST}\n" \
+      "$sep_srv" "$sep_vmid" "$sep_name" "$sep_type" "$sep_st" "$sep_ex"
+  else
+    printf "   %b%-${W_SRV}s  %-${W_VMID}s  %-${W_NAME}s  %-${W_TYPE}s  %-${W_ST}s%b\n" \
+      "${BOLD}" "SERVIDOR" "VMID" "NOMBRE" "TIPO" "ESTADO" "${RST}"
+    printf "   ${DIM}%s  %s  %s  %s  %s${RST}\n" \
+      "$sep_srv" "$sep_vmid" "$sep_name" "$sep_type" "$sep_st"
+  fi
+
+  for i in "${!G_VMID[@]}"; do
+    local t_color=""
+    case "${G_TYPE[$i]}" in VM) t_color="${CYN}" ;; CT) t_color="${BLU}" ;; esac
+
+    local s_color=""
+    case "${G_STATUS[$i],,}" in
+      running) s_color="${GRN}" ;;
+      stopped) s_color="${YLW}" ;;
+      *)       s_color="${DIM}" ;;
+    esac
+
+    if [[ -n "$extra_hdr" ]]; then
+      printf "   %-${W_SRV}s  %-${W_VMID}s  %-${W_NAME}s  %b%-${W_TYPE}s%b  %b%-${W_ST}s%b  ${MAG}%-${W_EX}s${RST}\n" \
+        "${G_SERVER[$i]}" "${G_VMID[$i]}" "${G_NAME[$i]}" \
+        "${t_color}" "${G_TYPE[$i]}"   "${RST}" \
+        "${s_color}" "${G_STATUS[$i]}" "${RST}" \
+        "${G_EXTRA[$i]:-}"
+    else
+      printf "   %-${W_SRV}s  %-${W_VMID}s  %-${W_NAME}s  %b%-${W_TYPE}s%b  %b%-${W_ST}s%b\n" \
+        "${G_SERVER[$i]}" "${G_VMID[$i]}" "${G_NAME[$i]}" \
+        "${t_color}" "${G_TYPE[$i]}"   "${RST}" \
+        "${s_color}" "${G_STATUS[$i]}" "${RST}"
+    fi
+  done
+}
+
+# run_remote_collect
+#
+# Itera sobre un bloque de entradas de servidores, ejecuta el script
+# almacenado en la variable global REMOTE_SCRIPT en cada nodo vía SSH,
+# y acumula los resultados en los arrays G_*.
+#
+# Args:
+#   $1 - Bloque de texto con entradas (hostname:puerto:usuario por línea).
+#   $2 - Timeout SSH en segundos.
+#   $3 - Modo verbose (1 = activado, 0 = desactivado).
+#   $@ - Argumentos adicionales que se pasan al script remoto como $1, $2...
+#
+# Globals modificados:
+#   G_SERVER, G_VMID, G_NAME, G_TYPE, G_STATUS, G_EXTRA  (resultados)
+#   FAILED                                                (servidores fallidos)
+declare -a FAILED=()
+run_remote_collect() {
+  local entries_blob="$1" timeout="$2" verbose="$3"; shift 3
+  local extra_args=("$@")
+
+  local -a SSH_OPTS=("${SSH_BASE_OPTS[@]}" -o ConnectTimeout="$timeout")
+
+  local idx=0 total
+  total="$(echo "$entries_blob" | grep -c . || true)"
+  (( total == 0 )) && return 0
+
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    idx=$(( idx + 1 ))
+
+    IFS=':' read -r srv_h srv_p srv_u <<< "${entry}::"
+    srv_p="${srv_p:-$DEFAULT_PORT}"; srv_u="${srv_u:-$DEFAULT_USER}"
+
+    if (( verbose )); then
+      printf "   ${DIM}[%d/%d]${RST} Conectando a ${BOLD}%s${RST}:%s  (usuario: %s)...\n" \
+        "$idx" "$total" "$srv_h" "$srv_p" "$srv_u"
+    else
+      printf "   ${DIM}[%d/%d] %s${RST}\n" "$idx" "$total" "$srv_h"
+    fi
+
+    if ! ssh "${SSH_OPTS[@]}" -p "$srv_p" "${srv_u}@${srv_h}" true 2>/dev/null; then
+      warn "Sin respuesta: ${BOLD}${srv_h}${RST}:${srv_p}"
+      FAILED+=("$srv_h")
+      continue
+    fi
+
+    # Leer el script remoto desde stdin (heredoc del llamador) — no es posible
+    # así que usamos un mecanismo de callback a través de variable global REMOTE_SCRIPT
+    local raw=""
+    raw="$(ssh "${SSH_OPTS[@]}" -p "$srv_p" "${srv_u}@${srv_h}" \
+      bash -s -- "${extra_args[@]}" 2>/dev/null <<< "$REMOTE_SCRIPT")" || true
+
+    if [[ -n "$raw" ]]; then
+      while IFS='|' read -r vmid name status type extra; do
+        [[ -z "$vmid" ]] && continue
+        G_SERVER+=("$srv_h")
+        G_VMID+=("$vmid")
+        G_NAME+=("$name")
+        G_STATUS+=("$status")
+        G_TYPE+=("$type")
+        G_EXTRA+=("${extra:-}")
+      done <<< "$raw"
+    fi
+  done <<< "$entries_blob"
 }
 
 # ======================= AYUDA ==========================
@@ -75,28 +300,38 @@ usage_main() {
   cat <<EOF
 ${BOLD}Uso:${RST}
   pvesearchin <comando> [opciones]
-  pvesearchin <nombre|vmid>          # búsqueda directa (atajo)
+  pvesearchin <nombre|vmid>           # búsqueda directa (atajo)
 
-${BOLD}Comandos:${RST}
-  search <query>     Buscar VM/CT por nombre o VMID
+${BOLD}Comandos — Gestión de servidores:${RST}
   add    <host>      Agregar servidor Proxmox
   remove <host>      Quitar servidor Proxmox
   edit   <host>      Modificar usuario/puerto de un servidor
   list               Listar servidores configurados
   export [archivo]   Exportar listado de servidores
   import <archivo>   Importar listado de servidores
+
+${BOLD}Comandos — Exploración:${RST}
+  search <query>     Buscar VM/CT por nombre o VMID
+  nodes  [host]      Listar todas las VMs/CTs de los nodos
+  status [host]      Resumen de recursos del clúster (CPU/RAM/disco)
+  orphans [host]     Detectar VMs/CTs apagadas por mucho tiempo
+  check-access       Verificar conectividad SSH a todos los servidores
+
+${BOLD}Otros:${RST}
+  update             Actualizar pvesearchin a la última versión
   version            Mostrar versión instalada
+  help [cmd]         Ayuda general o por subcomando
 
 ${BOLD}Ejemplos:${RST}
-  pvesearchin miservidor.com
-  pvesearchin search webserver -v
-  pvesearchin add pve1.empresa.com
-  pvesearchin add pve2.empresa.com --user admin --port 2222
-  pvesearchin remove pve1.empresa.com
-  pvesearchin edit pve2.empresa.com --port 22
-  pvesearchin list
-  pvesearchin export ~/backup_servidores.txt
-  pvesearchin import ~/backup_servidores.txt
+  pvesearchin webserver
+  pvesearchin search web --type vm --status running
+  pvesearchin nodes
+  pvesearchin nodes pve1.empresa.com --type ct
+  pvesearchin status
+  pvesearchin status pve2.empresa.com
+  pvesearchin orphans --days 14
+  pvesearchin check-access
+  pvesearchin update
 EOF
 }
 
@@ -106,9 +341,105 @@ ${BOLD}Uso:${RST}
   pvesearchin search <nombre|vmid> [opciones]
 
 ${BOLD}Opciones:${RST}
-  -t, --timeout SEC  Timeout SSH por servidor en segundos (default: 10)
-  -v, --verbose      Mostrar detalles de conexión
-  -h, --help         Esta ayuda
+  -T, --type   vm|ct      Filtrar por tipo (default: ambos)
+  -s, --status running|stopped
+                          Filtrar por estado (default: todos)
+  -t, --timeout SEC       Timeout SSH por servidor (default: 10)
+  -v, --verbose           Mostrar detalles de conexión
+  -h, --help              Esta ayuda
+
+${BOLD}Ejemplos:${RST}
+  pvesearchin search web
+  pvesearchin search web --type vm
+  pvesearchin search 105 --status running
+  pvesearchin search prod --type ct --status stopped -v
+EOF
+}
+
+usage_nodes() {
+  cat <<EOF
+${BOLD}Uso:${RST}
+  pvesearchin nodes [host] [opciones]
+
+${BOLD}Argumentos:${RST}
+  host                    Hostname de un servidor específico (opcional)
+                          Sin host, consulta todos los servidores configurados
+
+${BOLD}Opciones:${RST}
+  -T, --type   vm|ct      Filtrar por tipo (default: ambos)
+  -s, --status running|stopped
+                          Filtrar por estado (default: todos)
+  -t, --timeout SEC       Timeout SSH por servidor (default: 10)
+  -v, --verbose           Mostrar detalles de conexión
+  -h, --help              Esta ayuda
+
+${BOLD}Ejemplos:${RST}
+  pvesearchin nodes
+  pvesearchin nodes pve1.empresa.com
+  pvesearchin nodes --type vm --status running
+  pvesearchin nodes pve2.empresa.com --type ct
+EOF
+}
+
+usage_status() {
+  cat <<EOF
+${BOLD}Uso:${RST}
+  pvesearchin status [host] [opciones]
+
+${BOLD}Argumentos:${RST}
+  host                    Hostname de un servidor específico (opcional)
+                          Sin host, consulta todos los servidores configurados
+
+${BOLD}Opciones:${RST}
+  -t, --timeout SEC       Timeout SSH por servidor (default: 10)
+  -v, --verbose           Mostrar detalles de conexión
+  -h, --help              Esta ayuda
+
+${BOLD}Ejemplos:${RST}
+  pvesearchin status
+  pvesearchin status pve1.empresa.com
+EOF
+}
+
+usage_orphans() {
+  cat <<EOF
+${BOLD}Uso:${RST}
+  pvesearchin orphans [host] [opciones]
+
+Detecta VMs y CTs que llevan más de N días apagadas sin cambios en su
+configuración. Útil para identificar recursos que pueden estar abandonados.
+
+${BOLD}Argumentos:${RST}
+  host                    Hostname de un servidor específico (opcional)
+
+${BOLD}Opciones:${RST}
+  -d, --days N            Umbral en días (default: 30)
+  -t, --timeout SEC       Timeout SSH por servidor (default: 10)
+  -v, --verbose           Mostrar detalles de conexión
+  -h, --help              Esta ayuda
+
+${BOLD}Ejemplos:${RST}
+  pvesearchin orphans
+  pvesearchin orphans --days 14
+  pvesearchin orphans pve1.empresa.com --days 7
+EOF
+}
+
+usage_check_access() {
+  cat <<EOF
+${BOLD}Uso:${RST}
+  pvesearchin check-access [opciones]
+
+Verifica la conectividad SSH a todos los servidores configurados y muestra
+el estado de acceso, el usuario y la versión de Proxmox detectada.
+
+${BOLD}Opciones:${RST}
+  -t, --timeout SEC       Timeout SSH por servidor (default: 10)
+  -h, --help              Esta ayuda
+
+${BOLD}Ejemplo:${RST}
+  pvesearchin check-access
+  pvesearchin check-access --timeout 5
 EOF
 }
 
@@ -174,7 +505,6 @@ cmd_list() {
     return 0
   fi
 
-  # Calcular anchos de columna
   local W_IDX=3 W_HOST=8 W_PORT=6 W_USER=7
   local idx=0
   for e in "${entries[@]}"; do
@@ -186,15 +516,15 @@ cmd_list() {
     [[ ${#idx} -gt $W_IDX  ]] && W_IDX=${#idx}
   done
 
-  local SEP_IDX;  SEP_IDX="$(printf  '─%.0s' $(seq 1 $W_IDX))"
-  local SEP_HOST; SEP_HOST="$(printf '─%.0s' $(seq 1 $W_HOST))"
-  local SEP_PORT; SEP_PORT="$(printf '─%.0s' $(seq 1 $W_PORT))"
-  local SEP_USER; SEP_USER="$(printf '─%.0s' $(seq 1 $W_USER))"
+  local sep_idx;  sep_idx="$(printf  '─%.0s' $(seq 1 $W_IDX))"
+  local sep_host; sep_host="$(printf '─%.0s' $(seq 1 $W_HOST))"
+  local sep_port; sep_port="$(printf '─%.0s' $(seq 1 $W_PORT))"
+  local sep_user; sep_user="$(printf '─%.0s' $(seq 1 $W_USER))"
 
   printf "   %b%-${W_IDX}s  %-${W_HOST}s  %-${W_PORT}s  %-${W_USER}s%b\n" \
     "${BOLD}" "#" "HOSTNAME" "PUERTO" "USUARIO" "${RST}"
   printf "   ${DIM}%s  %s  %s  %s${RST}\n" \
-    "$SEP_IDX" "$SEP_HOST" "$SEP_PORT" "$SEP_USER"
+    "$sep_idx" "$sep_host" "$sep_port" "$sep_user"
 
   idx=0
   for e in "${entries[@]}"; do
@@ -287,7 +617,6 @@ cmd_edit() {
     usage_edit; exit 2
   }
 
-  # Leer valores actuales del servidor
   local cur_line; cur_line="$(read_servers | grep "^${host}:" | head -n1)"
   IFS=':' read -r _h cur_p cur_u <<< "${cur_line}::"
   cur_p="${cur_p:-$DEFAULT_PORT}"; cur_u="${cur_u:-$DEFAULT_USER}"
@@ -313,13 +642,12 @@ cmd_export() {
   ensure_config
 
   local outfile="${1:-}"
-  local header="# pvesearchin server list — exportado $(date +'%F %T') — v${VERSION}"
+  # SC2155: declarar y asignar por separado para no enmascarar el código de retorno.
+  local header
+  header="# pvesearchin server list — exportado $(date +'%F %T') — v${VERSION}"
 
   if [[ -n "$outfile" ]]; then
-    {
-      echo "$header"
-      read_servers
-    } > "$outfile"
+    { echo "$header"; read_servers; } > "$outfile"
     local count; count="$(read_servers | wc -l | tr -d ' ')"
     ok "Exportado a: ${BOLD}${outfile}${RST}  (${count} servidor(es))"
   else
@@ -340,16 +668,12 @@ cmd_import() {
   local added=0 skipped=0 invalid=0
 
   while IFS= read -r line || [[ -n "$line" ]]; do
-    # Ignorar comentarios y líneas vacías
     [[ "$line" =~ ^\s*# ]] && continue
     [[ -z "${line//[[:space:]]/}" ]] && continue
 
-    # Parsear host:port:user (port y user son opcionales)
     local h p u
     IFS=':' read -r h p u <<< "${line}::"
-    h="${h//[[:space:]]/}"
-    p="${p//[[:space:]]/}"
-    u="${u//[[:space:]]/}"
+    h="${h//[[:space:]]/}"; p="${p//[[:space:]]/}"; u="${u//[[:space:]]/}"
 
     if [[ -z "$h" ]]; then
       invalid=$(( invalid + 1 ))
@@ -374,36 +698,492 @@ cmd_import() {
 }
 
 # ======================= CMD: search ==========================
-SSH_OPTS=(
-  -o StrictHostKeyChecking=no
-  -o BatchMode=yes
-  -o PasswordAuthentication=no
-  -o LogLevel=ERROR
-)
-
 cmd_search() {
   [[ $# -eq 0 ]] && { usage_search; exit 0; }
 
   local query="$1"; shift
-  local timeout=10 verbose=0
+  local timeout=10 verbose=0 filter_type="" filter_status=""
 
   while [[ $# -gt 0 ]]; do
     case "${1:-}" in
-      -t|--timeout) timeout="${2:-10}"; shift 2 || { err "Falta valor para --timeout"; exit 2; } ;;
+      -T|--type)    filter_type="${2:-}";   shift 2 || { err "Falta valor para --type";   exit 2; } ;;
+      -s|--status)  filter_status="${2:-}"; shift 2 || { err "Falta valor para --status"; exit 2; } ;;
+      -t|--timeout) timeout="${2:-10}";     shift 2 || { err "Falta valor para --timeout";exit 2; } ;;
       -v|--verbose) verbose=1; shift ;;
       -h|--help)    usage_search; exit 0 ;;
       *) err "Opción no reconocida: $1"; usage_search; exit 2 ;;
     esac
   done
 
+  # Validar filtros
+  filter_type="${filter_type,,}"
+  filter_status="${filter_status,,}"
+  case "$filter_type" in vm|ct|"") : ;; *) err "--type debe ser vm o ct"; exit 2 ;; esac
+  case "$filter_status" in running|stopped|"") : ;; *) err "--status debe ser running o stopped"; exit 2 ;; esac
+
   [[ -z "$query" ]] && { err "Debes indicar un término de búsqueda."; exit 2; }
 
-  SSH_OPTS+=(-o ConnectTimeout="$timeout")
-
   ensure_config
+  reset_results
+  FAILED=()
+
   banner
   echo
-  printf " ${BOLD}🔍 Búsqueda:${RST}  %s\n" "$query"
+  printf " ${BOLD}🔍 Búsqueda:${RST}  %s" "$query"
+  [[ -n "$filter_type"   ]] && printf "  ${DIM}tipo=%s${RST}"   "$filter_type"
+  [[ -n "$filter_status" ]] && printf "  ${DIM}estado=%s${RST}" "$filter_status"
+  echo
+  printf " ${DIM}🗓  %s${RST}\n" "$(date +'%F %T')"
+  hr
+
+  local entries_blob; entries_blob="$(get_target_entries)"
+
+  if [[ -z "$entries_blob" ]]; then
+    warn "No hay servidores configurados."
+    info "Agrega uno con: ${BOLD}pvesearchin add <hostname>${RST}"
+    echo; exit 0
+  fi
+
+  local total; total="$(echo "$entries_blob" | grep -c . || true)"
+  info "Consultando ${BOLD}${total}${RST} servidor(es)..."
+  echo
+
+  # Script remoto: recibe $1=query $2=filter_type $3=filter_status
+  REMOTE_SCRIPT='#!/bin/sh
+Q="$1"; FTYPE="$2"; FSTATUS="$3"
+QL="$(printf "%s" "$Q" | tr "[:upper:]" "[:lower:]")"
+
+match_entry() {
+  local vmid="$1" name="$2" status="$3" type="$4"
+  local nl; nl="$(printf "%s" "$name" | tr "[:upper:]" "[:lower:]")"
+  # Filtro query
+  [ "$vmid" = "$Q" ] || printf "%s" "$nl" | grep -qF "$QL" || return 1
+  # Filtro tipo
+  [ -z "$FTYPE" ] || [ "$(printf "%s" "$type" | tr "[:upper:]" "[:lower:]")" = "$FTYPE" ] || return 1
+  # Filtro estado
+  [ -z "$FSTATUS" ] || [ "$(printf "%s" "$status" | tr "[:upper:]" "[:lower:]")" = "$FSTATUS" ] || return 1
+  printf "%s|%s|%s|%s|\n" "$vmid" "$name" "$status" "$type"
+}
+
+if command -v qm >/dev/null 2>&1; then
+  qm list 2>/dev/null | awk "NR>1" | while read -r vmid name status rest; do
+    match_entry "$vmid" "$name" "$status" "VM" || true
+  done
+fi
+if command -v pct >/dev/null 2>&1; then
+  pct list 2>/dev/null | awk "NR>1" | while read -r vmid status name rest; do
+    match_entry "$vmid" "$name" "$status" "CT" || true
+  done
+fi'
+
+  run_remote_collect "$entries_blob" "$timeout" "$verbose" "$query" "$filter_type" "$filter_status"
+
+  echo
+  hr
+
+  local found=${#G_VMID[@]}
+  if (( found == 0 )); then
+    warn "No se encontró ninguna VM/CT que coincida con ${BOLD}\"${query}\"${RST}."
+  else
+    printf "%b\n" " ${BOLD}${GRN}✔ ${found} resultado(s) para: \"${query}\"${RST}"
+    echo
+    render_vmct_table
+  fi
+
+  echo
+  hr
+  _print_failed_summary
+  ok "FIN  ${DIM}(servidores: ${total} | errores: ${#FAILED[@]} | resultados: ${found})${RST}"
+}
+
+# ======================= CMD: nodes ==========================
+cmd_nodes() {
+  local host_filter="" timeout=10 verbose=0 filter_type="" filter_status=""
+
+  # Primer arg posicional sin "-" = hostname filter
+  if [[ $# -gt 0 && "${1}" != -* ]]; then
+    host_filter="$1"; shift
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "${1:-}" in
+      -T|--type)    filter_type="${2:-}";   shift 2 || { err "Falta valor para --type";   exit 2; } ;;
+      -s|--status)  filter_status="${2:-}"; shift 2 || { err "Falta valor para --status"; exit 2; } ;;
+      -t|--timeout) timeout="${2:-10}";     shift 2 || { err "Falta valor para --timeout";exit 2; } ;;
+      -v|--verbose) verbose=1; shift ;;
+      -h|--help)    usage_nodes; exit 0 ;;
+      *) err "Opción no reconocida: $1"; usage_nodes; exit 2 ;;
+    esac
+  done
+
+  filter_type="${filter_type,,}"
+  filter_status="${filter_status,,}"
+  case "$filter_type" in vm|ct|"") : ;; *) err "--type debe ser vm o ct"; exit 2 ;; esac
+  case "$filter_status" in running|stopped|"") : ;; *) err "--status debe ser running o stopped"; exit 2 ;; esac
+
+  ensure_config
+  reset_results
+  FAILED=()
+
+  banner
+  echo
+  printf " ${BOLD}🗂  Inventario de VMs/CTs${RST}"
+  [[ -n "$host_filter"   ]] && printf "  ${DIM}nodo=%s${RST}"   "$host_filter"
+  [[ -n "$filter_type"   ]] && printf "  ${DIM}tipo=%s${RST}"   "$filter_type"
+  [[ -n "$filter_status" ]] && printf "  ${DIM}estado=%s${RST}" "$filter_status"
+  echo
+  printf " ${DIM}🗓  %s${RST}\n" "$(date +'%F %T')"
+  hr
+
+  local entries_blob; entries_blob="$(get_target_entries "$host_filter")"
+
+  if [[ -z "$entries_blob" ]]; then
+    warn "No hay servidores configurados."
+    info "Agrega uno con: ${BOLD}pvesearchin add <hostname>${RST}"
+    echo; exit 0
+  fi
+
+  local total; total="$(echo "$entries_blob" | grep -c . || true)"
+  info "Consultando ${BOLD}${total}${RST} servidor(es)..."
+  echo
+
+  # Sin filtro de query, lista todo (filtra tipo/estado si aplica)
+  REMOTE_SCRIPT='#!/bin/sh
+FTYPE="$1"; FSTATUS="$2"
+
+emit() {
+  local vmid="$1" name="$2" status="$3" type="$4"
+  [ -z "$FTYPE"   ] || [ "$(printf "%s" "$type"   | tr "[:upper:]" "[:lower:]")" = "$FTYPE"   ] || return 0
+  [ -z "$FSTATUS" ] || [ "$(printf "%s" "$status" | tr "[:upper:]" "[:lower:]")" = "$FSTATUS" ] || return 0
+  printf "%s|%s|%s|%s|\n" "$vmid" "$name" "$status" "$type"
+}
+
+if command -v qm >/dev/null 2>&1; then
+  qm list 2>/dev/null | awk "NR>1" | while read -r vmid name status rest; do
+    emit "$vmid" "$name" "$status" "VM"
+  done
+fi
+if command -v pct >/dev/null 2>&1; then
+  pct list 2>/dev/null | awk "NR>1" | while read -r vmid status name rest; do
+    emit "$vmid" "$name" "$status" "CT"
+  done
+fi'
+
+  run_remote_collect "$entries_blob" "$timeout" "$verbose" "$filter_type" "$filter_status"
+
+  echo
+  hr
+
+  local found=${#G_VMID[@]}
+  if (( found == 0 )); then
+    warn "No se encontraron VMs/CTs con los filtros indicados."
+  else
+    printf "%b\n" " ${BOLD}${GRN}✔ ${found} VM(s)/CT(s) encontrada(s)${RST}"
+    echo
+    render_vmct_table
+  fi
+
+  echo
+  hr
+  _print_failed_summary
+  ok "FIN  ${DIM}(servidores: ${total} | errores: ${#FAILED[@]} | total VMs/CTs: ${found})${RST}"
+}
+
+# ======================= CMD: status ==========================
+cmd_status() {
+  local host_filter="" timeout=10 verbose=0
+
+  if [[ $# -gt 0 && "${1}" != -* ]]; then
+    host_filter="$1"; shift
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "${1:-}" in
+      -t|--timeout) timeout="${2:-10}"; shift 2 || { err "Falta valor para --timeout"; exit 2; } ;;
+      -v|--verbose) verbose=1; shift ;;
+      -h|--help)    usage_status; exit 0 ;;
+      *) err "Opción no reconocida: $1"; usage_status; exit 2 ;;
+    esac
+  done
+
+  ensure_config
+
+  banner
+  echo
+  printf " ${BOLD}📊 Resumen del clúster Proxmox${RST}"
+  [[ -n "$host_filter" ]] && printf "  ${DIM}nodo=%s${RST}" "$host_filter"
+  echo
+  printf " ${DIM}🗓  %s${RST}\n" "$(date +'%F %T')"
+  hr
+
+  local entries_blob; entries_blob="$(get_target_entries "$host_filter")"
+
+  if [[ -z "$entries_blob" ]]; then
+    warn "No hay servidores configurados."
+    info "Agrega uno con: ${BOLD}pvesearchin add <hostname>${RST}"
+    echo; exit 0
+  fi
+
+  local total; total="$(echo "$entries_blob" | grep -c . || true)"
+  info "Consultando ${BOLD}${total}${RST} servidor(es)..."
+  echo
+
+  local -a SSH_OPTS=("${SSH_BASE_OPTS[@]}" -o ConnectTimeout="$timeout")
+  local -a FAILED_ST=()
+
+  # Acumular filas de status
+  declare -a ST_HOST=()
+  declare -a ST_NODO=()
+  declare -a ST_CORES=()
+  declare -a ST_LOAD=()
+  declare -a ST_RAM_USED=()
+  declare -a ST_RAM_TOTAL=()
+  declare -a ST_DISK=()
+  declare -a ST_VER=()
+  declare -a ST_UPTIME=()
+  declare -a ST_VMS=()
+  declare -a ST_CTS=()
+
+  local idx=0
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    idx=$(( idx + 1 ))
+
+    IFS=':' read -r srv_h srv_p srv_u <<< "${entry}::"
+    srv_p="${srv_p:-$DEFAULT_PORT}"; srv_u="${srv_u:-$DEFAULT_USER}"
+
+    if (( verbose )); then
+      printf "   ${DIM}[%d/%d]${RST} Conectando a ${BOLD}%s${RST}:%s...\n" \
+        "$idx" "$total" "$srv_h" "$srv_p"
+    else
+      printf "   ${DIM}[%d/%d] %s${RST}\n" "$idx" "$total" "$srv_h"
+    fi
+
+    if ! ssh "${SSH_OPTS[@]}" -p "$srv_p" "${srv_u}@${srv_h}" true 2>/dev/null; then
+      warn "Sin respuesta: ${BOLD}${srv_h}${RST}"
+      FAILED_ST+=("$srv_h")
+      continue
+    fi
+
+    local raw=""
+    raw="$(ssh "${SSH_OPTS[@]}" -p "$srv_p" "${srv_u}@${srv_h}" bash -s 2>/dev/null <<'REMOTESTATUS'
+#!/bin/sh
+NODE="$(hostname -s 2>/dev/null || hostname)"
+CORES="$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo '?')"
+LOAD="$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo '?')"
+
+MEM_TOTAL_KB="$(awk '/^MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+MEM_AVAIL_KB="$(awk '/^MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+MEM_USED_MB=$(( (MEM_TOTAL_KB - MEM_AVAIL_KB) / 1024 ))
+MEM_TOTAL_MB=$(( MEM_TOTAL_KB / 1024 ))
+
+DISK="$(df -h / 2>/dev/null | awk 'NR==2{print $3"/"$2" ("$5")"}'  || echo '?')"
+PVE_VER="$(pveversion 2>/dev/null | awk '{print $2}' | head -1 || echo 'N/D')"
+UPTIME_RAW="$(cat /proc/uptime 2>/dev/null | awk '{print $1}' || echo 0)"
+UPTIME_DAYS=$(( ${UPTIME_RAW%.*} / 86400 ))
+UPTIME_HRS=$(( (${UPTIME_RAW%.*} % 86400) / 3600 ))
+UPTIME="${UPTIME_DAYS}d ${UPTIME_HRS}h"
+
+VMS="$(qm list 2>/dev/null | awk 'NR>1' | wc -l || echo 0)"
+CTS="$(pct list 2>/dev/null | awk 'NR>1' | wc -l || echo 0)"
+
+printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+  "$NODE" "$CORES" "$LOAD" "$MEM_USED_MB" "$MEM_TOTAL_MB" "$DISK" "$PVE_VER" "$UPTIME" "$VMS" "$CTS"
+REMOTESTATUS
+    )" || true
+
+    if [[ -n "$raw" ]]; then
+      IFS='|' read -r nodo cores load ram_used ram_total disk ver uptime vms cts <<< "${raw}"
+      ST_HOST+=("$srv_h")
+      ST_NODO+=("$nodo")
+      ST_CORES+=("$cores")
+      ST_LOAD+=("$load")
+      ST_RAM_USED+=("${ram_used}M")
+      ST_RAM_TOTAL+=("${ram_total}M")
+      ST_DISK+=("$disk")
+      ST_VER+=("$ver")
+      ST_UPTIME+=("$uptime")
+      ST_VMS+=("$vms")
+      ST_CTS+=("$cts")
+    fi
+  done <<< "$entries_blob"
+
+  echo
+  hr
+
+  local rows=${#ST_HOST[@]}
+  if (( rows == 0 )); then
+    warn "No se pudo obtener información de ningún servidor."
+  else
+    printf "%b\n" " ${BOLD}${GRN}✔ Datos de ${rows} nodo(s)${RST}"
+    echo
+
+    # Anchos dinámicos de columna (W_VM y W_CT son fijos en 3 — "VMs"/"CTs")
+    local W_H=8 W_N=5 W_C=6 W_L=6 W_RAM=9 W_D=12 W_V=7 W_U=8
+    for i in "${!ST_HOST[@]}"; do
+      [[ ${#ST_HOST[$i]}     -gt $W_H  ]] && W_H=${#ST_HOST[$i]}
+      [[ ${#ST_NODO[$i]}     -gt $W_N  ]] && W_N=${#ST_NODO[$i]}
+      [[ ${#ST_LOAD[$i]}     -gt $W_L  ]] && W_L=${#ST_LOAD[$i]}
+      [[ ${#ST_RAM_USED[$i]} -gt $W_RAM ]] && W_RAM=${#ST_RAM_USED[$i]}
+      [[ ${#ST_DISK[$i]}     -gt $W_D  ]] && W_D=${#ST_DISK[$i]}
+      [[ ${#ST_VER[$i]}      -gt $W_V  ]] && W_V=${#ST_VER[$i]}
+      [[ ${#ST_UPTIME[$i]}   -gt $W_U  ]] && W_U=${#ST_UPTIME[$i]}
+    done
+
+    local sep_h;  sep_h="$(printf  '─%.0s' $(seq 1 $W_H))"
+    local sep_n;  sep_n="$(printf  '─%.0s' $(seq 1 $W_N))"
+    local sep_c;  sep_c="$(printf  '─%.0s' $(seq 1 $W_C))"
+    local sep_l;  sep_l="$(printf  '─%.0s' $(seq 1 $W_L))"
+    local sep_ram; sep_ram="$(printf '─%.0s' $(seq 1 $W_RAM))"
+    local sep_d;  sep_d="$(printf  '─%.0s' $(seq 1 $W_D))"
+    local sep_v;  sep_v="$(printf  '─%.0s' $(seq 1 $W_V))"
+    local sep_u;  sep_u="$(printf  '─%.0s' $(seq 1 $W_U))"
+
+    printf "   %b%-${W_H}s  %-${W_N}s  %-${W_C}s  %-${W_L}s  %-${W_RAM}s  %-${W_D}s  %-${W_V}s  %-${W_U}s  %s  %s%b\n" \
+      "${BOLD}" "SERVIDOR" "NODO" "CORES" "CARGA" "RAM USADA" "DISCO /" "PVE" "UPTIME" "VMs" "CTs" "${RST}"
+    printf "   ${DIM}%s  %s  %s  %s  %s  %s  %s  %s  %s  %s${RST}\n" \
+      "$sep_h" "$sep_n" "$sep_c" "$sep_l" "$sep_ram" "$sep_d" "$sep_v" "$sep_u" "───" "───"
+
+    for i in "${!ST_HOST[@]}"; do
+      # Color de carga
+      local l_color="${GRN}"
+      local load_int="${ST_LOAD[$i]%.*}"
+      local cores_int="${ST_CORES[$i]}"
+      if [[ "$load_int" =~ ^[0-9]+$ && "$cores_int" =~ ^[0-9]+$ ]]; then
+        (( load_int >= cores_int )) && l_color="${RED}"
+        (( load_int >= cores_int / 2 )) && (( load_int < cores_int )) && l_color="${YLW}"
+      fi
+
+      printf "   ${CYN}%-${W_H}s${RST}  %-${W_N}s  ${DIM}%-${W_C}s${RST}  %b%-${W_L}s${RST}  %-${W_RAM}s  %-${W_D}s  ${DIM}%-${W_V}s${RST}  %-${W_U}s  ${GRN}%-3s${RST}  ${BLU}%-3s${RST}\n" \
+        "${ST_HOST[$i]}" "${ST_NODO[$i]}" "${ST_CORES[$i]}" \
+        "${l_color}" "${ST_LOAD[$i]}" \
+        "${ST_RAM_USED[$i]}/${ST_RAM_TOTAL[$i]}" \
+        "${ST_DISK[$i]}" "${ST_VER[$i]}" "${ST_UPTIME[$i]}" \
+        "${ST_VMS[$i]}" "${ST_CTS[$i]}"
+    done
+  fi
+
+  echo
+  hr
+  if (( ${#FAILED_ST[@]} > 0 )); then
+    warn "Servidores sin respuesta (${#FAILED_ST[@]}):"
+    for f in "${FAILED_ST[@]}"; do printf "   ${DIM}✖ %s${RST}\n" "$f"; done
+    echo
+  fi
+  ok "FIN  ${DIM}(consultados: ${total} | errores: ${#FAILED_ST[@]} | respondieron: ${rows})${RST}"
+}
+
+# ======================= CMD: orphans ==========================
+cmd_orphans() {
+  local host_filter="" timeout=10 verbose=0 days=30
+
+  if [[ $# -gt 0 && "${1}" != -* ]]; then
+    host_filter="$1"; shift
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "${1:-}" in
+      -d|--days)    days="${2:-30}";    shift 2 || { err "Falta valor para --days";    exit 2; } ;;
+      -t|--timeout) timeout="${2:-10}"; shift 2 || { err "Falta valor para --timeout"; exit 2; } ;;
+      -v|--verbose) verbose=1; shift ;;
+      -h|--help)    usage_orphans; exit 0 ;;
+      *) err "Opción no reconocida: $1"; usage_orphans; exit 2 ;;
+    esac
+  done
+
+  [[ "$days" =~ ^[0-9]+$ ]] || { err "--days debe ser un número entero positivo."; exit 2; }
+
+  ensure_config
+  reset_results
+  FAILED=()
+
+  banner
+  echo
+  printf " ${BOLD}👻 VMs/CTs huérfanas — apagadas sin cambios ≥ %s días${RST}" "$days"
+  [[ -n "$host_filter" ]] && printf "  ${DIM}nodo=%s${RST}" "$host_filter"
+  echo
+  printf " ${DIM}🗓  %s${RST}\n" "$(date +'%F %T')"
+  hr
+
+  local entries_blob; entries_blob="$(get_target_entries "$host_filter")"
+
+  if [[ -z "$entries_blob" ]]; then
+    warn "No hay servidores configurados."
+    echo; exit 0
+  fi
+
+  local total; total="$(echo "$entries_blob" | grep -c . || true)"
+  info "Consultando ${BOLD}${total}${RST} servidor(es)  ${DIM}(umbral: ${days} días)${RST}..."
+  echo
+
+  # Script remoto: recibe $1=days
+  REMOTE_SCRIPT='#!/bin/sh
+DAYS="$1"
+CUTOFF=$(( DAYS * 86400 ))
+NOW="$(date +%s)"
+
+check_stopped() {
+  local vmid="$1" name="$2" type="$3" conf="$4"
+  local mtime age age_days
+  if [ -f "$conf" ]; then
+    mtime="$(stat -c %Y "$conf" 2>/dev/null || echo 0)"
+    age=$(( NOW - mtime ))
+    if [ "$age" -ge "$CUTOFF" ]; then
+      age_days=$(( age / 86400 ))
+      printf "%s|%s|stopped|%s|%sd\n" "$vmid" "$name" "$type" "$age_days"
+    fi
+  fi
+}
+
+if command -v qm >/dev/null 2>&1; then
+  qm list 2>/dev/null | awk "NR>1 && \$3==\"stopped\"" | while read -r vmid name status rest; do
+    check_stopped "$vmid" "$name" "VM" "/etc/pve/qemu-server/${vmid}.conf"
+  done
+fi
+if command -v pct >/dev/null 2>&1; then
+  pct list 2>/dev/null | awk "NR>1 && \$2==\"stopped\"" | while read -r vmid status name rest; do
+    check_stopped "$vmid" "$name" "CT" "/etc/pve/lxc/${vmid}.conf"
+  done
+fi'
+
+  run_remote_collect "$entries_blob" "$timeout" "$verbose" "$days"
+
+  echo
+  hr
+
+  local found=${#G_VMID[@]}
+  if (( found == 0 )); then
+    ok "No se detectaron VMs/CTs huérfanas con umbral de ${BOLD}${days}${RST} días."
+  else
+    printf "%b\n" " ${BOLD}${YLW}⚠ ${found} VM(s)/CT(s) candidata(s) a huérfana${RST}  ${DIM}(sin cambios ≥ ${days} días)${RST}"
+    info "La columna ${BOLD}SIN CAMBIOS${RST} refleja días desde la última modificación de configuración."
+    echo
+    render_vmct_table "SIN CAMBIOS"
+  fi
+
+  echo
+  hr
+  _print_failed_summary
+  ok "FIN  ${DIM}(servidores: ${total} | errores: ${#FAILED[@]} | huérfanas detectadas: ${found})${RST}"
+}
+
+# ======================= CMD: check-access ==========================
+cmd_check_access() {
+  local timeout=10
+
+  while [[ $# -gt 0 ]]; do
+    case "${1:-}" in
+      -t|--timeout) timeout="${2:-10}"; shift 2 || { err "Falta valor para --timeout"; exit 2; } ;;
+      -h|--help)    usage_check_access; exit 0 ;;
+      *) err "Opción no reconocida: $1"; usage_check_access; exit 2 ;;
+    esac
+  done
+
+  ensure_config
+
+  banner
+  echo
+  printf " ${BOLD}🔑 Verificación de acceso SSH${RST}\n"
   printf " ${DIM}🗓  %s${RST}\n" "$(date +'%F %T')"
   hr
 
@@ -415,182 +1195,327 @@ cmd_search() {
   if (( ${#entries[@]} == 0 )); then
     warn "No hay servidores configurados."
     info "Agrega uno con: ${BOLD}pvesearchin add <hostname>${RST}"
+    echo; exit 0
+  fi
+
+  local -a SSH_OPTS=("${SSH_BASE_OPTS[@]}" -o ConnectTimeout="$timeout")
+
+  local -a CA_HOST=() CA_PORT=() CA_USER=() CA_STATUS=() CA_VER=() CA_KEY=()
+  local ok_count=0 fail_count=0
+
+  local idx=0 total=${#entries[@]}
+  info "Verificando ${BOLD}${total}${RST} servidor(es)..."
+  echo
+
+  for entry in "${entries[@]}"; do
+    idx=$(( idx + 1 ))
+    IFS=':' read -r srv_h srv_p srv_u <<< "${entry}::"
+    srv_p="${srv_p:-$DEFAULT_PORT}"; srv_u="${srv_u:-$DEFAULT_USER}"
+
+    printf "   ${DIM}[%d/%d]${RST} %s:%s..." "$idx" "$total" "$srv_h" "$srv_p"
+
+    local pve_ver="N/D" status_str="" key_info=""
+
+    if ssh "${SSH_OPTS[@]}" -p "$srv_p" "${srv_u}@${srv_h}" true 2>/dev/null; then
+      pve_ver="$(ssh "${SSH_OPTS[@]}" -p "$srv_p" "${srv_u}@${srv_h}" \
+        "pveversion 2>/dev/null | awk '{print \$2}' | head -1 || echo 'N/D'" 2>/dev/null || echo 'N/D')"
+      # Detectar qué llave fue usada (ssh -v filtra la llave aceptada)
+      key_info="$(ssh "${SSH_OPTS[@]}" -v -p "$srv_p" "${srv_u}@${srv_h}" true 2>&1 | \
+        grep -o 'Offering public key: .*' | head -1 | sed 's/Offering public key: //' || echo '')"
+      [[ -z "$key_info" ]] && key_info="auto"
+      status_str="OK"
+      ok_count=$(( ok_count + 1 ))
+      printf " ${GRN}✔${RST}\n"
+    else
+      status_str="FALLO"
+      fail_count=$(( fail_count + 1 ))
+      key_info="—"
+      printf " ${RED}✖${RST}\n"
+    fi
+
+    CA_HOST+=("$srv_h"); CA_PORT+=("$srv_p"); CA_USER+=("$srv_u")
+    CA_STATUS+=("$status_str"); CA_VER+=("$pve_ver"); CA_KEY+=("$key_info")
+  done
+
+  echo
+  hr
+  printf "%b\n" " ${BOLD}📋 Resultado${RST}"
+  echo
+
+  # Anchos dinámicos
+  local W_H=8 W_P=6 W_U=7 W_ST=6 W_V=7 W_K=4
+  for i in "${!CA_HOST[@]}"; do
+    [[ ${#CA_HOST[$i]}   -gt $W_H  ]] && W_H=${#CA_HOST[$i]}
+    [[ ${#CA_PORT[$i]}   -gt $W_P  ]] && W_P=${#CA_PORT[$i]}
+    [[ ${#CA_USER[$i]}   -gt $W_U  ]] && W_U=${#CA_USER[$i]}
+    [[ ${#CA_STATUS[$i]} -gt $W_ST ]] && W_ST=${#CA_STATUS[$i]}
+    [[ ${#CA_VER[$i]}    -gt $W_V  ]] && W_V=${#CA_VER[$i]}
+    [[ ${#CA_KEY[$i]}    -gt $W_K  ]] && W_K=${#CA_KEY[$i]}
+  done
+
+  local sep_h;  sep_h="$(printf  '─%.0s' $(seq 1 $W_H))"
+  local sep_p;  sep_p="$(printf  '─%.0s' $(seq 1 $W_P))"
+  local sep_u;  sep_u="$(printf  '─%.0s' $(seq 1 $W_U))"
+  local sep_st; sep_st="$(printf '─%.0s' $(seq 1 $W_ST))"
+  local sep_v;  sep_v="$(printf  '─%.0s' $(seq 1 $W_V))"
+  local sep_k;  sep_k="$(printf  '─%.0s' $(seq 1 $W_K))"
+
+  printf "   %b%-${W_H}s  %-${W_P}s  %-${W_U}s  %-${W_ST}s  %-${W_V}s  %-${W_K}s%b\n" \
+    "${BOLD}" "SERVIDOR" "PUERTO" "USUARIO" "ESTADO" "PVE" "LLAVE" "${RST}"
+  printf "   ${DIM}%s  %s  %s  %s  %s  %s${RST}\n" \
+    "$sep_h" "$sep_p" "$sep_u" "$sep_st" "$sep_v" "$sep_k"
+
+  for i in "${!CA_HOST[@]}"; do
+    local s_color=""
+    [[ "${CA_STATUS[$i]}" == "OK"    ]] && s_color="${GRN}"
+    [[ "${CA_STATUS[$i]}" == "FALLO" ]] && s_color="${RED}"
+
+    printf "   ${CYN}%-${W_H}s${RST}  %-${W_P}s  ${DIM}%-${W_U}s${RST}  %b%-${W_ST}s${RST}  ${DIM}%-${W_V}s${RST}  %-${W_K}s\n" \
+      "${CA_HOST[$i]}" "${CA_PORT[$i]}" "${CA_USER[$i]}" \
+      "${s_color}" "${CA_STATUS[$i]}" "${CA_VER[$i]}" "${CA_KEY[$i]}"
+  done
+
+  echo
+  hr
+  ok "FIN  ${DIM}(total: ${total} | ${GRN}OK: ${ok_count}${RST} | ${RED}fallos: ${fail_count}${RST})${RST}"
+}
+
+# ======================= CMD: update ==========================
+# usage_update
+#
+# Imprime la ayuda del subcomando update.
+usage_update() {
+  cat <<EOF
+${BOLD}Uso:${RST}
+  pvesearchin update [opciones]
+
+Descarga la última versión desde GitHub y reemplaza el binario instalado.
+Valida el script descargado antes de reemplazar para evitar instalaciones rotas.
+
+${BOLD}Opciones:${RST}
+  -f, --force        Reinstalar aunque ya sea la versión más reciente
+  -t, --timeout SEC  Timeout de descarga en segundos (default: 15)
+  -h, --help         Esta ayuda
+
+${BOLD}Ejemplos:${RST}
+  pvesearchin update
+  pvesearchin update --force
+  sudo pvesearchin update          # si el binario está en /usr/local/bin
+
+${BOLD}Actualizar en servidores remotos:${RST}
+  ssh root@servidor 'pvesearchin update'
+  # O reinstalar desde cero con el instalador:
+  curl -fsSL https://raw.githubusercontent.com/ONieto/pvesearchin/main/install.sh | bash
+EOF
+}
+
+# _version_gt
+#
+# Compara dos versiones semver y determina si la primera es mayor que la segunda.
+#
+# Args:
+#   $1 - Versión A (ej: "1.2.0")
+#   $2 - Versión B (ej: "1.1.3")
+#
+# Returns:
+#   0 si A > B, 1 en caso contrario.
+_version_gt() {
+  local a="$1" b="$2"
+  # Divide cada versión en major.minor.patch y compara numéricamente
+  local IFS='.'
+  read -r a1 a2 a3 <<< "$a"
+  read -r b1 b2 b3 <<< "$b"
+  a1="${a1:-0}"; a2="${a2:-0}"; a3="${a3:-0}"
+  b1="${b1:-0}"; b2="${b2:-0}"; b3="${b3:-0}"
+  (( a1 > b1 )) && return 0
+  (( a1 == b1 && a2 > b2 )) && return 0
+  (( a1 == b1 && a2 == b2 && a3 > b3 )) && return 0
+  return 1
+}
+
+# cmd_update
+#
+# Descarga la última versión del script desde GitHub, la valida y reemplaza
+# el binario instalado. Requiere permiso de escritura sobre el binario.
+#
+# Args:
+#   $@ - Opciones de línea de comandos.
+cmd_update() {
+  local force=0 timeout=15
+
+  while [[ $# -gt 0 ]]; do
+    case "${1:-}" in
+      -f|--force)   force=1; shift ;;
+      -t|--timeout) timeout="${2:-15}"; shift 2 || { err "Falta valor para --timeout"; exit 2; } ;;
+      -h|--help)    usage_update; exit 0 ;;
+      *) err "Opción no reconocida: $1"; usage_update; exit 2 ;;
+    esac
+  done
+
+  local raw_url="https://raw.githubusercontent.com/ONieto/pvesearchin/main/pvesearchin"
+  local ver_url="https://raw.githubusercontent.com/ONieto/pvesearchin/main/version.txt"
+
+  # Localizar el binario instalado
+  local self
+  self="$(command -v pvesearchin 2>/dev/null || true)"
+  if [[ -z "$self" ]]; then
+    self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  fi
+
+  banner
+  echo
+  printf " ${BOLD}🔄 Actualización de pvesearchin${RST}\n"
+  printf " ${DIM}🗓  %s${RST}\n" "$(date +'%F %T')"
+  hr
+
+  info "Versión instalada:  ${BOLD}v${VERSION}${RST}"
+  info "Binario:            ${DIM}${self}${RST}"
+  echo
+
+  # Verificar permiso de escritura antes de descargar nada
+  if [[ ! -w "$self" ]]; then
+    err "Sin permiso de escritura sobre: ${BOLD}${self}${RST}"
+    info "Ejecuta con sudo:   ${BOLD}sudo pvesearchin update${RST}"
+    exit 1
+  fi
+
+  # Verificar disponibilidad de curl o wget
+  local downloader=""
+  if command -v curl >/dev/null 2>&1; then
+    downloader="curl"
+  elif command -v wget >/dev/null 2>&1; then
+    downloader="wget"
+  else
+    err "No se encontró curl ni wget. Instala uno e intenta de nuevo."
+    exit 1
+  fi
+
+  # Función interna de descarga
+  _fetch() {
+    local url="$1" dest="$2"
+    if [[ "$downloader" == "curl" ]]; then
+      curl -fsSL --max-time "$timeout" "$url" -o "$dest" 2>/dev/null
+    else
+      wget -qO "$dest" --timeout="$timeout" "$url" 2>/dev/null
+    fi
+  }
+
+  # --- Paso 1: obtener versión remota ---
+  info "Consultando versión disponible en GitHub..."
+  local tmp_ver; tmp_ver="$(mktemp)"
+  if ! _fetch "$ver_url" "$tmp_ver" || [[ ! -s "$tmp_ver" ]]; then
+    rm -f "$tmp_ver"
+    err "No se pudo obtener la versión remota. Verifica tu conexión."
+    exit 1
+  fi
+  local remote_version
+  remote_version="$(tr -d '[:space:]' < "$tmp_ver")"
+  rm -f "$tmp_ver"
+
+  info "Versión disponible:  ${BOLD}v${remote_version}${RST}"
+  echo
+
+  # --- Paso 2: comparar versiones ---
+  if ! _version_gt "$remote_version" "$VERSION" && (( ! force )); then
+    ok "Ya tienes la versión más reciente ${BOLD}(v${VERSION})${RST}."
+    info "Usa ${BOLD}--force${RST} para reinstalar igualmente."
     echo
     exit 0
   fi
 
-  info "Consultando ${BOLD}${#entries[@]}${RST} servidor(es)..."
-  echo
-
-  # Arrays para acumular resultados
-  declare -a RES_SERVER=()
-  declare -a RES_VMID=()
-  declare -a RES_NAME=()
-  declare -a RES_TYPE=()
-  declare -a RES_STATUS=()
-  declare -a FAILED=()
-
-  local idx=0 total=${#entries[@]}
-
-  for entry in "${entries[@]}"; do
-    idx=$(( idx + 1 ))
-
-    IFS=':' read -r srv_h srv_p srv_u <<< "${entry}::"
-    srv_p="${srv_p:-$DEFAULT_PORT}"; srv_u="${srv_u:-$DEFAULT_USER}"
-
-    if (( verbose )); then
-      printf "   ${DIM}[%d/%d]${RST} Conectando a ${BOLD}%s${RST}:%s  (usuario: %s)...\n" \
-        "$idx" "$total" "$srv_h" "$srv_p" "$srv_u"
-    else
-      printf "   ${DIM}[%d/%d] %s${RST}\n" "$idx" "$total" "$srv_h"
-    fi
-
-    # Verificar conectividad
-    if ! ssh "${SSH_OPTS[@]}" -p "$srv_p" "${srv_u}@${srv_h}" true 2>/dev/null; then
-      warn "Sin respuesta: ${BOLD}${srv_h}${RST}:${srv_p}"
-      FAILED+=("$srv_h")
-      continue
-    fi
-
-    # Ejecutar búsqueda remota — QUERY se pasa como argumento ($1) para evitar problemas de escape
-    local raw=""
-    raw="$(ssh "${SSH_OPTS[@]}" -p "$srv_p" "${srv_u}@${srv_h}" bash -s -- "$query" 2>/dev/null <<'REMOTESCRIPT'
-#!/bin/sh
-Q="$1"
-QL="$(printf '%s' "$Q" | tr '[:upper:]' '[:lower:]')"
-
-# --- VMs (QEMU) ---
-if command -v qm >/dev/null 2>&1; then
-  qm list 2>/dev/null | awk 'NR>1' | while read -r vmid name status rest; do
-    nl="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
-    if [ "$vmid" = "$Q" ] || printf '%s' "$nl" | grep -qF "$QL"; then
-      printf '%s|%s|%s|VM\n' "$vmid" "$name" "$status"
-    fi
-  done
-fi
-
-# --- CTs (LXC) ---
-if command -v pct >/dev/null 2>&1; then
-  pct list 2>/dev/null | awk 'NR>1' | while read -r vmid status name rest; do
-    nl="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
-    if [ "$vmid" = "$Q" ] || printf '%s' "$nl" | grep -qF "$QL"; then
-      printf '%s|%s|%s|CT\n' "$vmid" "$name" "$status"
-    fi
-  done
-fi
-REMOTESCRIPT
-    )" || true
-
-    if [[ -n "$raw" ]]; then
-      while IFS='|' read -r vmid name status type; do
-        [[ -z "$vmid" ]] && continue
-        RES_SERVER+=("$srv_h")
-        RES_VMID+=("$vmid")
-        RES_NAME+=("$name")
-        RES_STATUS+=("$status")
-        RES_TYPE+=("$type")
-      done <<< "$raw"
-    fi
-  done
-
-  echo
-  hr
-
-  # ── Tabla de resultados ──
-  local found=${#RES_VMID[@]}
-
-  if (( found == 0 )); then
-    warn "No se encontró ninguna VM/CT que coincida con ${BOLD}\"${query}\"${RST}."
+  if (( force )) && ! _version_gt "$remote_version" "$VERSION"; then
+    warn "Reinstalando v${remote_version} (--force activado)."
   else
-    printf "%b\n" " ${BOLD}${GRN}✔ ${found} resultado(s) para: \"${query}\"${RST}"
-    echo
-
-    # Anchos dinámicos
-    local W_SRV=8 W_VMID=4 W_NAME=6 W_TYPE=4 W_ST=6
-    for i in "${!RES_VMID[@]}"; do
-      [[ ${#RES_SERVER[$i]} -gt $W_SRV  ]] && W_SRV=${#RES_SERVER[$i]}
-      [[ ${#RES_VMID[$i]}   -gt $W_VMID ]] && W_VMID=${#RES_VMID[$i]}
-      [[ ${#RES_NAME[$i]}   -gt $W_NAME ]] && W_NAME=${#RES_NAME[$i]}
-      [[ ${#RES_TYPE[$i]}   -gt $W_TYPE ]] && W_TYPE=${#RES_TYPE[$i]}
-      [[ ${#RES_STATUS[$i]} -gt $W_ST   ]] && W_ST=${#RES_STATUS[$i]}
-    done
-
-    local SEP_SRV;  SEP_SRV="$(printf  '─%.0s' $(seq 1 $W_SRV))"
-    local SEP_VMID; SEP_VMID="$(printf '─%.0s' $(seq 1 $W_VMID))"
-    local SEP_NAME; SEP_NAME="$(printf '─%.0s' $(seq 1 $W_NAME))"
-    local SEP_TYPE; SEP_TYPE="$(printf '─%.0s' $(seq 1 $W_TYPE))"
-    local SEP_ST;   SEP_ST="$(printf   '─%.0s' $(seq 1 $W_ST))"
-
-    printf "   %b%-${W_SRV}s  %-${W_VMID}s  %-${W_NAME}s  %-${W_TYPE}s  %-${W_ST}s%b\n" \
-      "${BOLD}" "SERVIDOR" "VMID" "NOMBRE" "TIPO" "ESTADO" "${RST}"
-    printf "   ${DIM}%s  %s  %s  %s  %s${RST}\n" \
-      "$SEP_SRV" "$SEP_VMID" "$SEP_NAME" "$SEP_TYPE" "$SEP_ST"
-
-    for i in "${!RES_VMID[@]}"; do
-      local t_color=""
-      case "${RES_TYPE[$i]}" in VM) t_color="${CYN}" ;; CT) t_color="${BLU}" ;; esac
-
-      local s_color=""
-      case "${RES_STATUS[$i],,}" in
-        running) s_color="${GRN}" ;;
-        stopped) s_color="${YLW}" ;;
-        *)       s_color="${DIM}" ;;
-      esac
-
-      printf "   %-${W_SRV}s  %-${W_VMID}s  %-${W_NAME}s  %b%-${W_TYPE}s%b  %b%-${W_ST}s%b\n" \
-        "${RES_SERVER[$i]}" "${RES_VMID[$i]}" "${RES_NAME[$i]}" \
-        "${t_color}" "${RES_TYPE[$i]}"    "${RST}" \
-        "${s_color}" "${RES_STATUS[$i]}"  "${RST}"
-    done
+    info "Nueva versión disponible: ${BOLD}v${VERSION}${RST} → ${GRN}v${remote_version}${RST}"
   fi
 
+  # --- Paso 3: descargar a archivo temporal ---
+  info "Descargando v${remote_version}..."
+  local tmp_script; tmp_script="$(mktemp)"
+  if ! _fetch "$raw_url" "$tmp_script" || [[ ! -s "$tmp_script" ]]; then
+    rm -f "$tmp_script"
+    err "Error al descargar la actualización."
+    exit 1
+  fi
+
+  # --- Paso 4: validar que sea un script bash válido ---
+  if ! bash -n "$tmp_script" 2>/dev/null; then
+    rm -f "$tmp_script"
+    err "El archivo descargado no pasó la validación de sintaxis bash. Abortando."
+    info "El binario instalado NO fue modificado."
+    exit 1
+  fi
+
+  # --- Paso 5: reemplazar el binario ---
+  chmod +x "$tmp_script"
+  mv "$tmp_script" "$self"
+
   echo
   hr
+  ok "Actualizado: v${VERSION} → ${GRN}v${remote_version}${RST}"
+  ok "Instalado en: ${BOLD}${self}${RST}"
+  echo
+}
 
+# ======================= HELPER INTERNO ==========================
+_print_failed_summary() {
   if (( ${#FAILED[@]} > 0 )); then
     warn "Servidores sin respuesta (${#FAILED[@]}):"
-    for f in "${FAILED[@]}"; do
-      printf "   ${DIM}✖ %s${RST}\n" "$f"
-    done
+    for f in "${FAILED[@]}"; do printf "   ${DIM}✖ %s${RST}\n" "$f"; done
     echo
   fi
-
-  ok "FIN  ${DIM}(servidores: ${total} | errores: ${#FAILED[@]} | resultados: ${found})${RST}"
 }
 
 # ======================= MAIN ==========================
-[[ $# -eq 0 ]] && { banner; echo; usage_main; exit 0; }
+# main
+#
+# Punto de entrada principal. Parsea el primer argumento como subcomando
+# y delega al handler correspondiente. Cualquier argumento no reconocido
+# como subcomando se trata como término de búsqueda directo.
+#
+# Args:
+#   $@ - Argumentos de línea de comandos originales del script.
+main() {
+  [[ $# -eq 0 ]] && { banner; echo; usage_main; exit 0; }
 
-CMD="${1}"; shift
+  local CMD="${1}"; shift
 
-case "$CMD" in
-  search)                   cmd_search  "$@" ;;
-  add)                      cmd_add     "$@" ;;
-  remove|rm|delete)         cmd_remove  "$@" ;;
-  edit|update)              cmd_edit    "$@" ;;
+  case "$CMD" in
+  search)                   cmd_search       "$@" ;;
+  nodes|ls-all)             cmd_nodes        "$@" ;;
+  status)                   cmd_status       "$@" ;;
+  orphans)                  cmd_orphans      "$@" ;;
+  check-access|ssh-check)   cmd_check_access "$@" ;;
+  update)                   cmd_update       "$@" ;;
+  add)                      cmd_add          "$@" ;;
+  remove|rm|delete)         cmd_remove       "$@" ;;
+  edit)                     cmd_edit         "$@" ;;
   list|ls)                  cmd_list ;;
-  export)                   cmd_export  "${1:-}" ;;
-  import)                   cmd_import  "$@" ;;
+  export)                   cmd_export       "${1:-}" ;;
+  import)                   cmd_import       "$@" ;;
   version|-V|--version)     printf "pvesearchin v%s\n" "$VERSION"; exit 0 ;;
   -h|--help)                banner; echo; usage_main; exit 0 ;;
   help)
-    # "pvesearchin help"              → ayuda general
-    # "pvesearchin help <subcomando>" → ayuda del subcomando
     if [[ $# -gt 0 ]]; then
       case "${1}" in
-        search)                   banner; echo; usage_search; exit 0 ;;
-        add)                      banner; echo; usage_add;    exit 0 ;;
+        search)                 banner; echo; usage_search;       exit 0 ;;
+        nodes|ls-all)           banner; echo; usage_nodes;        exit 0 ;;
+        status)                 banner; echo; usage_status;       exit 0 ;;
+        orphans)                banner; echo; usage_orphans;      exit 0 ;;
+        check-access|ssh-check) banner; echo; usage_check_access; exit 0 ;;
+        update)                 banner; echo; usage_update;       exit 0 ;;
+        add)                    banner; echo; usage_add;          exit 0 ;;
         remove|rm|delete)
           printf "\n${BOLD}Uso:${RST}\n  pvesearchin remove <hostname>\n\n"
           printf "Elimina un servidor del listado configurado.\n\n"; exit 0 ;;
-        edit|update)              banner; echo; usage_edit;   exit 0 ;;
+        edit)                   banner; echo; usage_edit;         exit 0 ;;
         list|ls)
           printf "\n${BOLD}Uso:${RST}\n  pvesearchin list\n\n"
           printf "Muestra todos los servidores Proxmox configurados.\n\n"; exit 0 ;;
         export)
           printf "\n${BOLD}Uso:${RST}\n  pvesearchin export [archivo]\n\n"
           printf "Sin archivo imprime en stdout. Con archivo guarda el listado.\n\n"; exit 0 ;;
-        import)                   banner; echo; usage_import; exit 0 ;;
+        import)                 banner; echo; usage_import;       exit 0 ;;
         version)
           printf "\n${BOLD}Uso:${RST}\n  pvesearchin version\n\n"
           printf "Muestra la versión instalada.\n\n"; exit 0 ;;
@@ -600,5 +1525,8 @@ case "$CMD" in
     banner; echo; usage_main; exit 0
     ;;
   # Cualquier otra cosa se interpreta como búsqueda directa
-  *)                        cmd_search  "$CMD" "$@" ;;
-esac
+  *)  cmd_search "$CMD" "$@" ;;
+  esac
+}
+
+main "$@"
