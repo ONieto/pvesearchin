@@ -1,0 +1,578 @@
+#!/usr/bin/env bash
+# pvesearchin — Proxmox VM/CT Search
+# Busca VMs y CTs por nombre o VMID en múltiples nodos Proxmox.
+# Gestiona el listado de servidores en ~/.config/pvesearchin/servers
+# Repo: https://github.com/ONieto/pvesearchin
+# Requiere: bash 4+, ssh
+
+set -euo pipefail
+IFS=$'\n\t'
+
+VERSION="1.0.0"
+CONFIG_DIR="${HOME}/.config/pvesearchin"
+CONFIG_FILE="${CONFIG_DIR}/servers"
+DEFAULT_USER="root"
+DEFAULT_PORT="22"
+
+# ======================= ESTILO ==========================
+HR="────────────────────────────────────────────────────────────────────────"
+
+supports_color() {
+  [[ -t 1 ]] || return 1
+  command -v tput >/dev/null 2>&1 || return 1
+  local ncolors; ncolors=$(tput colors 2>/dev/null || echo 0)
+  (( ncolors >= 8 ))
+}
+
+if supports_color; then
+  BOLD="$(printf '\033[1m')"; DIM="$(printf '\033[2m')"
+  RED="$(printf '\033[31m')";  GRN="$(printf '\033[32m')"; YLW="$(printf '\033[33m')"
+  BLU="$(printf '\033[34m')";  CYN="$(printf '\033[36m')"
+  RST="$(printf '\033[0m')"
+else
+  BOLD=""; DIM=""; RED=""; GRN=""; YLW=""; BLU=""; CYN=""; RST=""
+fi
+
+hr()   { printf "%b\n" "${DIM}${HR}${RST}"; }
+ok()   { printf "%b\n" " ${GRN}✔${RST} $*"; }
+info() { printf "%b\n" " ${BLU}ℹ${RST} $*"; }
+warn() { printf "%b\n" " ${YLW}⚠${RST} $*"; }
+err()  { printf "%b\n" " ${RED}✖${RST} $*" >&2; }
+
+banner() {
+  printf "%b" "${BOLD}"
+  cat <<'ASCII'
+ _ ____   _____  ___  __ _ _ __ ___| |__ (_)_ __
+| '_ \ \ / / _ \/ __|/ _` | '__/ __| '_ \| | '_ \
+| |_) \ V /  __/\__ \ (_| | | | (__| | | | | | | |
+| .__/ \_/ \___||___/\__,_|_|  \___|_| |_|_|_| |_|
+|_|
+ASCII
+  printf "%b" "${RST}"
+  printf "%b\n" "${DIM}       Proxmox VM/CT Search — v${VERSION}${RST}"
+}
+
+# ======================= CONFIG ==========================
+ensure_config() {
+  mkdir -p "$CONFIG_DIR"
+  [[ -f "$CONFIG_FILE" ]] || touch "$CONFIG_FILE"
+}
+
+# Lee servidores del config (ignora comentarios y líneas vacías)
+# Devuelve líneas: hostname:port:user
+read_servers() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  grep -v '^\s*#' "$CONFIG_FILE" | grep -v '^\s*$' || true
+}
+
+server_exists() {
+  local host="$1"
+  read_servers | awk -F: '{print $1}' | grep -qx "$host" 2>/dev/null
+}
+
+# ======================= AYUDA ==========================
+usage_main() {
+  cat <<EOF
+${BOLD}Uso:${RST}
+  pvesearchin <comando> [opciones]
+  pvesearchin <nombre|vmid>          # búsqueda directa (atajo)
+
+${BOLD}Comandos:${RST}
+  search <query>     Buscar VM/CT por nombre o VMID
+  add    <host>      Agregar servidor Proxmox
+  remove <host>      Quitar servidor Proxmox
+  edit   <host>      Modificar usuario/puerto de un servidor
+  list               Listar servidores configurados
+  export [archivo]   Exportar listado de servidores
+  import <archivo>   Importar listado de servidores
+  version            Mostrar versión instalada
+
+${BOLD}Ejemplos:${RST}
+  pvesearchin miservidor.com
+  pvesearchin search webserver -v
+  pvesearchin add pve1.empresa.com
+  pvesearchin add pve2.empresa.com --user admin --port 2222
+  pvesearchin remove pve1.empresa.com
+  pvesearchin edit pve2.empresa.com --port 22
+  pvesearchin list
+  pvesearchin export ~/backup_servidores.txt
+  pvesearchin import ~/backup_servidores.txt
+EOF
+}
+
+usage_search() {
+  cat <<EOF
+${BOLD}Uso:${RST}
+  pvesearchin search <nombre|vmid> [opciones]
+
+${BOLD}Opciones:${RST}
+  -t, --timeout SEC  Timeout SSH por servidor en segundos (default: 10)
+  -v, --verbose      Mostrar detalles de conexión
+  -h, --help         Esta ayuda
+EOF
+}
+
+usage_add() {
+  cat <<EOF
+${BOLD}Uso:${RST}
+  pvesearchin add <hostname> [opciones]
+
+${BOLD}Opciones:${RST}
+  -u, --user USER    Usuario SSH (default: root)
+  -p, --port PORT    Puerto SSH  (default: 22)
+  -h, --help         Esta ayuda
+
+${BOLD}Ejemplos:${RST}
+  pvesearchin add pve1.empresa.com
+  pvesearchin add pve2.empresa.com --user admin --port 2222
+EOF
+}
+
+usage_edit() {
+  cat <<EOF
+${BOLD}Uso:${RST}
+  pvesearchin edit <hostname> [opciones]
+
+${BOLD}Opciones:${RST}
+  -u, --user USER    Nuevo usuario SSH
+  -p, --port PORT    Nuevo puerto SSH
+  -h, --help         Esta ayuda
+
+${BOLD}Ejemplo:${RST}
+  pvesearchin edit pve1.empresa.com --user root --port 22
+EOF
+}
+
+usage_import() {
+  cat <<EOF
+${BOLD}Uso:${RST}
+  pvesearchin import <archivo>
+
+El archivo debe seguir el mismo formato que export:
+  hostname:puerto:usuario
+  # las líneas con # son ignoradas
+EOF
+}
+
+# ======================= CMD: list ==========================
+cmd_list() {
+  ensure_config
+  banner
+  echo
+  printf " ${BOLD}📋 Servidores Proxmox configurados${RST}\n"
+  hr
+
+  local entries=()
+  while IFS= read -r line; do
+    entries+=("$line")
+  done < <(read_servers)
+
+  if (( ${#entries[@]} == 0 )); then
+    warn "No hay servidores configurados."
+    info "Agrega uno con: ${BOLD}pvesearchin add <hostname>${RST}"
+    echo
+    return 0
+  fi
+
+  # Calcular anchos de columna
+  local W_IDX=3 W_HOST=8 W_PORT=6 W_USER=7
+  local idx=0
+  for e in "${entries[@]}"; do
+    idx=$(( idx + 1 ))
+    IFS=':' read -r h p u <<< "${e}::"
+    [[ ${#h}   -gt $W_HOST ]] && W_HOST=${#h}
+    [[ ${#p}   -gt $W_PORT ]] && W_PORT=${#p}
+    [[ ${#u}   -gt $W_USER ]] && W_USER=${#u}
+    [[ ${#idx} -gt $W_IDX  ]] && W_IDX=${#idx}
+  done
+
+  local SEP_IDX;  SEP_IDX="$(printf  '─%.0s' $(seq 1 $W_IDX))"
+  local SEP_HOST; SEP_HOST="$(printf '─%.0s' $(seq 1 $W_HOST))"
+  local SEP_PORT; SEP_PORT="$(printf '─%.0s' $(seq 1 $W_PORT))"
+  local SEP_USER; SEP_USER="$(printf '─%.0s' $(seq 1 $W_USER))"
+
+  printf "   %b%-${W_IDX}s  %-${W_HOST}s  %-${W_PORT}s  %-${W_USER}s%b\n" \
+    "${BOLD}" "#" "HOSTNAME" "PUERTO" "USUARIO" "${RST}"
+  printf "   ${DIM}%s  %s  %s  %s${RST}\n" \
+    "$SEP_IDX" "$SEP_HOST" "$SEP_PORT" "$SEP_USER"
+
+  idx=0
+  for e in "${entries[@]}"; do
+    idx=$(( idx + 1 ))
+    IFS=':' read -r h p u <<< "${e}::"
+    p="${p:-$DEFAULT_PORT}"; u="${u:-$DEFAULT_USER}"
+    printf "   %-${W_IDX}s  ${CYN}%-${W_HOST}s${RST}  %-${W_PORT}s  ${DIM}%-${W_USER}s${RST}\n" \
+      "$idx" "$h" "$p" "$u"
+  done
+
+  echo
+  ok "Total: ${#entries[@]} servidor(es)  ${DIM}— Config: ${CONFIG_FILE}${RST}"
+}
+
+# ======================= CMD: add ==========================
+cmd_add() {
+  [[ $# -eq 0 ]] && { usage_add; exit 0; }
+
+  local host="$1"; shift
+  local port="$DEFAULT_PORT" user="$DEFAULT_USER"
+
+  while [[ $# -gt 0 ]]; do
+    case "${1:-}" in
+      -u|--user) user="${2:-}"; shift 2 || { err "Falta valor para --user"; exit 2; } ;;
+      -p|--port) port="${2:-}"; shift 2 || { err "Falta valor para --port"; exit 2; } ;;
+      -h|--help) usage_add; exit 0 ;;
+      *) err "Opción no reconocida: $1"; usage_add; exit 2 ;;
+    esac
+  done
+
+  [[ -z "$host" ]] && { err "Debes indicar un hostname."; exit 2; }
+  [[ -z "$port" ]] && port="$DEFAULT_PORT"
+  [[ -z "$user" ]] && user="$DEFAULT_USER"
+
+  ensure_config
+
+  if server_exists "$host"; then
+    err "El servidor ${BOLD}${host}${RST} ya está en la lista."
+    info "Usa ${BOLD}pvesearchin edit ${host}${RST} para modificarlo."
+    exit 1
+  fi
+
+  echo "${host}:${port}:${user}" >> "$CONFIG_FILE"
+  ok "Servidor agregado: ${BOLD}${host}${RST}  puerto=${port}  usuario=${user}"
+}
+
+# ======================= CMD: remove ==========================
+cmd_remove() {
+  [[ $# -eq 0 ]] && { err "Debes indicar un hostname."; exit 2; }
+  local host="$1"
+
+  ensure_config
+
+  if ! server_exists "$host"; then
+    err "El servidor ${BOLD}${host}${RST} no está en la lista."
+    exit 1
+  fi
+
+  local tmp; tmp="$(mktemp)"
+  grep -v "^${host}:" "$CONFIG_FILE" > "$tmp" || true
+  mv "$tmp" "$CONFIG_FILE"
+  ok "Servidor eliminado: ${BOLD}${host}${RST}"
+}
+
+# ======================= CMD: edit ==========================
+cmd_edit() {
+  [[ $# -eq 0 ]] && { usage_edit; exit 0; }
+  local host="$1"; shift
+
+  local new_port="" new_user=""
+
+  while [[ $# -gt 0 ]]; do
+    case "${1:-}" in
+      -u|--user) new_user="${2:-}"; shift 2 || { err "Falta valor para --user"; exit 2; } ;;
+      -p|--port) new_port="${2:-}"; shift 2 || { err "Falta valor para --port"; exit 2; } ;;
+      -h|--help) usage_edit; exit 0 ;;
+      *) err "Opción no reconocida: $1"; usage_edit; exit 2 ;;
+    esac
+  done
+
+  ensure_config
+
+  if ! server_exists "$host"; then
+    err "El servidor ${BOLD}${host}${RST} no está en la lista."
+    exit 1
+  fi
+
+  [[ -z "$new_port" && -z "$new_user" ]] && {
+    err "Debes especificar al menos --user o --port para modificar."
+    usage_edit; exit 2
+  }
+
+  # Leer valores actuales del servidor
+  local cur_line; cur_line="$(read_servers | grep "^${host}:" | head -n1)"
+  IFS=':' read -r _h cur_p cur_u <<< "${cur_line}::"
+  cur_p="${cur_p:-$DEFAULT_PORT}"; cur_u="${cur_u:-$DEFAULT_USER}"
+
+  local upd_port="${new_port:-$cur_p}"
+  local upd_user="${new_user:-$cur_u}"
+
+  local tmp; tmp="$(mktemp)"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^${host}: ]]; then
+      echo "${host}:${upd_port}:${upd_user}"
+    else
+      echo "$line"
+    fi
+  done < "$CONFIG_FILE" > "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+
+  ok "Servidor actualizado: ${BOLD}${host}${RST}  puerto=${upd_port}  usuario=${upd_user}"
+}
+
+# ======================= CMD: export ==========================
+cmd_export() {
+  ensure_config
+
+  local outfile="${1:-}"
+  local header="# pvesearchin server list — exportado $(date +'%F %T') — v${VERSION}"
+
+  if [[ -n "$outfile" ]]; then
+    {
+      echo "$header"
+      read_servers
+    } > "$outfile"
+    local count; count="$(read_servers | wc -l | tr -d ' ')"
+    ok "Exportado a: ${BOLD}${outfile}${RST}  (${count} servidor(es))"
+  else
+    echo "$header"
+    read_servers
+  fi
+}
+
+# ======================= CMD: import ==========================
+cmd_import() {
+  [[ $# -eq 0 ]] && { usage_import; exit 0; }
+  local infile="$1"
+
+  [[ -f "$infile" ]] || { err "Archivo no encontrado: ${BOLD}${infile}${RST}"; exit 1; }
+
+  ensure_config
+
+  local added=0 skipped=0 invalid=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Ignorar comentarios y líneas vacías
+    [[ "$line" =~ ^\s*# ]] && continue
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+
+    # Parsear host:port:user (port y user son opcionales)
+    local h p u
+    IFS=':' read -r h p u <<< "${line}::"
+    h="${h//[[:space:]]/}"
+    p="${p//[[:space:]]/}"
+    u="${u//[[:space:]]/}"
+
+    if [[ -z "$h" ]]; then
+      invalid=$(( invalid + 1 ))
+      warn "Línea inválida ignorada: '${line}'"
+      continue
+    fi
+
+    p="${p:-$DEFAULT_PORT}"; u="${u:-$DEFAULT_USER}"
+
+    if server_exists "$h"; then
+      skipped=$(( skipped + 1 ))
+      info "Ya existe, se omite: ${h}"
+    else
+      echo "${h}:${p}:${u}" >> "$CONFIG_FILE"
+      added=$(( added + 1 ))
+      ok "Importado: ${BOLD}${h}${RST}  puerto=${p}  usuario=${u}"
+    fi
+  done < "$infile"
+
+  echo
+  info "Importación completa — ${GRN}agregados: ${added}${RST}  omitidos: ${skipped}  inválidos: ${invalid}"
+}
+
+# ======================= CMD: search ==========================
+SSH_OPTS=(
+  -o StrictHostKeyChecking=no
+  -o BatchMode=yes
+  -o PasswordAuthentication=no
+  -o LogLevel=ERROR
+)
+
+cmd_search() {
+  [[ $# -eq 0 ]] && { usage_search; exit 0; }
+
+  local query="$1"; shift
+  local timeout=10 verbose=0
+
+  while [[ $# -gt 0 ]]; do
+    case "${1:-}" in
+      -t|--timeout) timeout="${2:-10}"; shift 2 || { err "Falta valor para --timeout"; exit 2; } ;;
+      -v|--verbose) verbose=1; shift ;;
+      -h|--help)    usage_search; exit 0 ;;
+      *) err "Opción no reconocida: $1"; usage_search; exit 2 ;;
+    esac
+  done
+
+  [[ -z "$query" ]] && { err "Debes indicar un término de búsqueda."; exit 2; }
+
+  SSH_OPTS+=(-o ConnectTimeout="$timeout")
+
+  ensure_config
+  banner
+  echo
+  printf " ${BOLD}🔍 Búsqueda:${RST}  %s\n" "$query"
+  printf " ${DIM}🗓  %s${RST}\n" "$(date +'%F %T')"
+  hr
+
+  local entries=()
+  while IFS= read -r line; do
+    entries+=("$line")
+  done < <(read_servers)
+
+  if (( ${#entries[@]} == 0 )); then
+    warn "No hay servidores configurados."
+    info "Agrega uno con: ${BOLD}pvesearchin add <hostname>${RST}"
+    echo
+    exit 0
+  fi
+
+  info "Consultando ${BOLD}${#entries[@]}${RST} servidor(es)..."
+  echo
+
+  # Arrays para acumular resultados
+  declare -a RES_SERVER=()
+  declare -a RES_VMID=()
+  declare -a RES_NAME=()
+  declare -a RES_TYPE=()
+  declare -a RES_STATUS=()
+  declare -a FAILED=()
+
+  local idx=0 total=${#entries[@]}
+
+  for entry in "${entries[@]}"; do
+    idx=$(( idx + 1 ))
+
+    IFS=':' read -r srv_h srv_p srv_u <<< "${entry}::"
+    srv_p="${srv_p:-$DEFAULT_PORT}"; srv_u="${srv_u:-$DEFAULT_USER}"
+
+    if (( verbose )); then
+      printf "   ${DIM}[%d/%d]${RST} Conectando a ${BOLD}%s${RST}:%s  (usuario: %s)...\n" \
+        "$idx" "$total" "$srv_h" "$srv_p" "$srv_u"
+    else
+      printf "   ${DIM}[%d/%d] %s${RST}\n" "$idx" "$total" "$srv_h"
+    fi
+
+    # Verificar conectividad
+    if ! ssh "${SSH_OPTS[@]}" -p "$srv_p" "${srv_u}@${srv_h}" true 2>/dev/null; then
+      warn "Sin respuesta: ${BOLD}${srv_h}${RST}:${srv_p}"
+      FAILED+=("$srv_h")
+      continue
+    fi
+
+    # Ejecutar búsqueda remota — QUERY se pasa como argumento ($1) para evitar problemas de escape
+    local raw=""
+    raw="$(ssh "${SSH_OPTS[@]}" -p "$srv_p" "${srv_u}@${srv_h}" bash -s -- "$query" 2>/dev/null <<'REMOTESCRIPT'
+#!/bin/sh
+Q="$1"
+QL="$(printf '%s' "$Q" | tr '[:upper:]' '[:lower:]')"
+
+# --- VMs (QEMU) ---
+if command -v qm >/dev/null 2>&1; then
+  qm list 2>/dev/null | awk 'NR>1' | while read -r vmid name status rest; do
+    nl="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+    if [ "$vmid" = "$Q" ] || printf '%s' "$nl" | grep -qF "$QL"; then
+      printf '%s|%s|%s|VM\n' "$vmid" "$name" "$status"
+    fi
+  done
+fi
+
+# --- CTs (LXC) ---
+if command -v pct >/dev/null 2>&1; then
+  pct list 2>/dev/null | awk 'NR>1' | while read -r vmid status name rest; do
+    nl="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+    if [ "$vmid" = "$Q" ] || printf '%s' "$nl" | grep -qF "$QL"; then
+      printf '%s|%s|%s|CT\n' "$vmid" "$name" "$status"
+    fi
+  done
+fi
+REMOTESCRIPT
+    )" || true
+
+    if [[ -n "$raw" ]]; then
+      while IFS='|' read -r vmid name status type; do
+        [[ -z "$vmid" ]] && continue
+        RES_SERVER+=("$srv_h")
+        RES_VMID+=("$vmid")
+        RES_NAME+=("$name")
+        RES_STATUS+=("$status")
+        RES_TYPE+=("$type")
+      done <<< "$raw"
+    fi
+  done
+
+  echo
+  hr
+
+  # ── Tabla de resultados ──
+  local found=${#RES_VMID[@]}
+
+  if (( found == 0 )); then
+    warn "No se encontró ninguna VM/CT que coincida con ${BOLD}\"${query}\"${RST}."
+  else
+    printf "%b\n" " ${BOLD}${GRN}✔ ${found} resultado(s) para: \"${query}\"${RST}"
+    echo
+
+    # Anchos dinámicos
+    local W_SRV=8 W_VMID=4 W_NAME=6 W_TYPE=4 W_ST=6
+    for i in "${!RES_VMID[@]}"; do
+      [[ ${#RES_SERVER[$i]} -gt $W_SRV  ]] && W_SRV=${#RES_SERVER[$i]}
+      [[ ${#RES_VMID[$i]}   -gt $W_VMID ]] && W_VMID=${#RES_VMID[$i]}
+      [[ ${#RES_NAME[$i]}   -gt $W_NAME ]] && W_NAME=${#RES_NAME[$i]}
+      [[ ${#RES_TYPE[$i]}   -gt $W_TYPE ]] && W_TYPE=${#RES_TYPE[$i]}
+      [[ ${#RES_STATUS[$i]} -gt $W_ST   ]] && W_ST=${#RES_STATUS[$i]}
+    done
+
+    local SEP_SRV;  SEP_SRV="$(printf  '─%.0s' $(seq 1 $W_SRV))"
+    local SEP_VMID; SEP_VMID="$(printf '─%.0s' $(seq 1 $W_VMID))"
+    local SEP_NAME; SEP_NAME="$(printf '─%.0s' $(seq 1 $W_NAME))"
+    local SEP_TYPE; SEP_TYPE="$(printf '─%.0s' $(seq 1 $W_TYPE))"
+    local SEP_ST;   SEP_ST="$(printf   '─%.0s' $(seq 1 $W_ST))"
+
+    printf "   %b%-${W_SRV}s  %-${W_VMID}s  %-${W_NAME}s  %-${W_TYPE}s  %-${W_ST}s%b\n" \
+      "${BOLD}" "SERVIDOR" "VMID" "NOMBRE" "TIPO" "ESTADO" "${RST}"
+    printf "   ${DIM}%s  %s  %s  %s  %s${RST}\n" \
+      "$SEP_SRV" "$SEP_VMID" "$SEP_NAME" "$SEP_TYPE" "$SEP_ST"
+
+    for i in "${!RES_VMID[@]}"; do
+      local t_color=""
+      case "${RES_TYPE[$i]}" in VM) t_color="${CYN}" ;; CT) t_color="${BLU}" ;; esac
+
+      local s_color=""
+      case "${RES_STATUS[$i],,}" in
+        running) s_color="${GRN}" ;;
+        stopped) s_color="${YLW}" ;;
+        *)       s_color="${DIM}" ;;
+      esac
+
+      printf "   %-${W_SRV}s  %-${W_VMID}s  %-${W_NAME}s  %b%-${W_TYPE}s%b  %b%-${W_ST}s%b\n" \
+        "${RES_SERVER[$i]}" "${RES_VMID[$i]}" "${RES_NAME[$i]}" \
+        "${t_color}" "${RES_TYPE[$i]}"    "${RST}" \
+        "${s_color}" "${RES_STATUS[$i]}"  "${RST}"
+    done
+  fi
+
+  echo
+  hr
+
+  if (( ${#FAILED[@]} > 0 )); then
+    warn "Servidores sin respuesta (${#FAILED[@]}):"
+    for f in "${FAILED[@]}"; do
+      printf "   ${DIM}✖ %s${RST}\n" "$f"
+    done
+    echo
+  fi
+
+  ok "FIN  ${DIM}(servidores: ${total} | errores: ${#FAILED[@]} | resultados: ${found})${RST}"
+}
+
+# ======================= MAIN ==========================
+[[ $# -eq 0 ]] && { banner; echo; usage_main; exit 0; }
+
+CMD="${1}"; shift
+
+case "$CMD" in
+  search)                   cmd_search  "$@" ;;
+  add)                      cmd_add     "$@" ;;
+  remove|rm|delete)         cmd_remove  "$@" ;;
+  edit|update)              cmd_edit    "$@" ;;
+  list|ls)                  cmd_list ;;
+  export)                   cmd_export  "${1:-}" ;;
+  import)                   cmd_import  "$@" ;;
+  version|-V|--version)     printf "pvesearchin v%s\n" "$VERSION"; exit 0 ;;
+  -h|--help|help)           banner; echo; usage_main; exit 0 ;;
+  # Cualquier otra cosa se interpreta como búsqueda directa
+  *)                        cmd_search  "$CMD" "$@" ;;
+esac
