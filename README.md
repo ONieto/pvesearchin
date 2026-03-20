@@ -24,7 +24,7 @@
 | `check-access` | Verifica conectividad SSH y muestra la llave usada por nodo |
 | Gestión de servidores | `add`, `remove`, `edit`, `list`, `export`, `import` |
 | Ayuda por subcomando | `pvesearchin help <cmd>` o `pvesearchin <cmd> --help` |
-| Compatible con PVE 5, 6, 7, 8 | Usa `qm` y `pct` disponibles en toda instalación Proxmox |
+| Compatible con PVE 5, 6, 7, 8 y 9 | Usa `qm` y `pct` disponibles en toda instalación Proxmox |
 
 ---
 
