@@ -8,7 +8,7 @@
 | |_) \ V /  __/\__ \ (_| | | | (__| | | | | | | |
 | .__/ \_/ \___||___/\__,_|_|  \___|_| |_|_|_| |_|
 |_|
-       Proxmox VM/CT Search — v1.1.0
+       Proxmox VM/CT Search — v1.2.0
 ```
 
 ---
@@ -137,14 +137,18 @@ pvesearchin nodes                            # todos los nodos
 pvesearchin nodes pve1.empresa.com           # un nodo específico
 pvesearchin nodes --type vm                  # solo VMs en todos los nodos
 pvesearchin nodes --status stopped           # todo lo apagado
+pvesearchin nodes --status running           # todo lo encendido
 pvesearchin nodes pve2.empresa.com --type ct # CTs de un nodo específico
+pvesearchin nodes --names                    # solo nombres, sin tabla
+pvesearchin nodes --status stopped --names   # nombres de VMs/CTs detenidas
 ```
 
 | Opción | Descripción |
 |---|---|
 | `[host]` | Hostname de un nodo específico (primer argumento, opcional) |
 | `-T, --type vm\|ct` | Filtrar por tipo |
-| `-s, --status running\|stopped` | Filtrar por estado |
+| `-s, --status running\|stopped` | Filtrar por estado (`running` = encendidas, `stopped` = detenidas) |
+| `-n, --names` | Mostrar únicamente los nombres, sin tabla |
 | `-t, --timeout SEC` | Timeout SSH |
 | `-v, --verbose` | Detalles de conexión |
 
@@ -330,7 +334,7 @@ hostname:puerto:usuario
 |---|---|
 | `pvesearchin <query>` | Búsqueda directa (atajo) |
 | `pvesearchin search <query> [--type vm\|ct] [--status running\|stopped]` | Búsqueda con filtros |
-| `pvesearchin nodes [host] [--type] [--status]` | Inventario de VMs/CTs |
+| `pvesearchin nodes [host] [--type] [--status] [--names]` | Inventario de VMs/CTs |
 | `pvesearchin status [host]` | Resumen CPU/RAM/disco por nodo |
 | `pvesearchin orphans [host] [--days N]` | Detectar VMs/CTs abandonadas |
 | `pvesearchin check-access` | Verificar acceso SSH a todos los nodos |
