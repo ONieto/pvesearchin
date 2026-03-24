@@ -18,7 +18,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ======================= CONSTANTES GLOBALES ==========================
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 readonly CONFIG_DIR="${HOME}/.config/pvesearchin"
 readonly CONFIG_FILE="${CONFIG_DIR}/servers"
 readonly DEFAULT_USER="root"
@@ -312,7 +312,9 @@ ${BOLD}Comandos — Gestión de servidores:${RST}
 
 ${BOLD}Comandos — Exploración:${RST}
   search <query>     Buscar VM/CT por nombre o VMID
-  nodes  [host]      Listar todas las VMs/CTs de los nodos
+  nodes  [host]      Listar VMs/CTs de todos los servidores o de uno específico
+                     Filtra por estado (--status running|stopped) o tipo (--type vm|ct)
+                     Usa --names para mostrar sólo los nombres sin tabla
   status [host]      Resumen de recursos del clúster (CPU/RAM/disco)
   orphans [host]     Detectar VMs/CTs apagadas por mucho tiempo
   check-access       Verificar conectividad SSH a todos los servidores
@@ -326,7 +328,10 @@ ${BOLD}Ejemplos:${RST}
   pvesearchin webserver
   pvesearchin search web --type vm --status running
   pvesearchin nodes
+  pvesearchin nodes pve1.empresa.com
   pvesearchin nodes pve1.empresa.com --type ct
+  pvesearchin nodes --status stopped
+  pvesearchin nodes --names
   pvesearchin status
   pvesearchin status pve2.empresa.com
   pvesearchin orphans --days 14
@@ -368,7 +373,11 @@ ${BOLD}Argumentos:${RST}
 ${BOLD}Opciones:${RST}
   -T, --type   vm|ct      Filtrar por tipo (default: ambos)
   -s, --status running|stopped
-                          Filtrar por estado (default: todos)
+                          Filtrar por estado:
+                            running  — sólo VMs/CTs encendidas
+                            stopped  — sólo VMs/CTs detenidas
+                            (sin valor — lista todas, default)
+  -n, --names             Mostrar únicamente los nombres, sin tabla
   -t, --timeout SEC       Timeout SSH por servidor (default: 10)
   -v, --verbose           Mostrar detalles de conexión
   -h, --help              Esta ayuda
@@ -377,7 +386,9 @@ ${BOLD}Ejemplos:${RST}
   pvesearchin nodes
   pvesearchin nodes pve1.empresa.com
   pvesearchin nodes --type vm --status running
-  pvesearchin nodes pve2.empresa.com --type ct
+  pvesearchin nodes --status stopped
+  pvesearchin nodes --names
+  pvesearchin nodes pve2.empresa.com --type ct --names
 EOF
 }
 
@@ -798,7 +809,7 @@ fi'
 
 # ======================= CMD: nodes ==========================
 cmd_nodes() {
-  local host_filter="" timeout=10 verbose=0 filter_type="" filter_status=""
+  local host_filter="" timeout=10 verbose=0 filter_type="" filter_status="" names_only=0
 
   # Primer arg posicional sin "-" = hostname filter
   if [[ $# -gt 0 && "${1}" != -* ]]; then
@@ -809,6 +820,7 @@ cmd_nodes() {
     case "${1:-}" in
       -T|--type)    filter_type="${2:-}";   shift 2 || { err "Falta valor para --type";   exit 2; } ;;
       -s|--status)  filter_status="${2:-}"; shift 2 || { err "Falta valor para --status"; exit 2; } ;;
+      -n|--names)   names_only=1; shift ;;
       -t|--timeout) timeout="${2:-10}";     shift 2 || { err "Falta valor para --timeout";exit 2; } ;;
       -v|--verbose) verbose=1; shift ;;
       -h|--help)    usage_nodes; exit 0 ;;
@@ -877,6 +889,12 @@ fi'
   local found=${#G_VMID[@]}
   if (( found == 0 )); then
     warn "No se encontraron VMs/CTs con los filtros indicados."
+  elif (( names_only )); then
+    printf "%b\n" " ${BOLD}${GRN}✔ ${found} VM(s)/CT(s)${RST}"
+    echo
+    for i in "${!G_NAME[@]}"; do
+      printf "   %s\n" "${G_NAME[$i]}"
+    done
   else
     printf "%b\n" " ${BOLD}${GRN}✔ ${found} VM(s)/CT(s) encontrada(s)${RST}"
     echo
