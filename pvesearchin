@@ -18,7 +18,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ======================= CONSTANTES GLOBALES ==========================
-readonly VERSION="1.3.0"
+readonly VERSION="1.3.1"
 readonly CONFIG_DIR="${HOME}/.config/pvesearchin"
 readonly CONFIG_FILE="${CONFIG_DIR}/servers"
 readonly DEFAULT_USER="root"
@@ -535,8 +535,51 @@ El archivo debe seguir el mismo formato que export:
 EOF
 }
 
+usage_list() {
+  cat <<EOF
+${BOLD}Uso:${RST}
+  pvesearchin list
+
+Muestra todos los servidores Proxmox configurados con su hostname, puerto y usuario SSH.
+
+${BOLD}Ejemplo:${RST}
+  pvesearchin list
+EOF
+}
+
+usage_remove() {
+  cat <<EOF
+${BOLD}Uso:${RST}
+  pvesearchin remove <hostname>
+
+Elimina un servidor del listado configurado.
+
+${BOLD}Aliases:${RST}
+  rm, delete
+
+${BOLD}Ejemplos:${RST}
+  pvesearchin remove pve1.empresa.com
+  pvesearchin rm pve2.empresa.com
+EOF
+}
+
+usage_export() {
+  cat <<EOF
+${BOLD}Uso:${RST}
+  pvesearchin export [archivo]
+
+Exporta el listado de servidores configurados.
+Sin archivo imprime en stdout. Con archivo guarda el listado en disco.
+
+${BOLD}Ejemplos:${RST}
+  pvesearchin export
+  pvesearchin export ~/servidores.txt
+EOF
+}
+
 # ======================= CMD: list ==========================
 cmd_list() {
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage_list; exit 0; }
   ensure_config
   banner
   echo
@@ -592,6 +635,7 @@ cmd_list() {
 # ======================= CMD: add ==========================
 cmd_add() {
   [[ $# -eq 0 ]] && { usage_add; exit 0; }
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage_add; exit 0; }
 
   local host="$1"; shift
   local port="$DEFAULT_PORT" user="$DEFAULT_USER"
@@ -623,7 +667,8 @@ cmd_add() {
 
 # ======================= CMD: remove ==========================
 cmd_remove() {
-  [[ $# -eq 0 ]] && { err "Debes indicar un hostname."; exit 2; }
+  [[ $# -eq 0 ]] && { usage_remove; exit 0; }
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage_remove; exit 0; }
   local host="$1"
 
   ensure_config
@@ -642,6 +687,7 @@ cmd_remove() {
 # ======================= CMD: edit ==========================
 cmd_edit() {
   [[ $# -eq 0 ]] && { usage_edit; exit 0; }
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage_edit; exit 0; }
   local host="$1"; shift
 
   local new_port="" new_user=""
@@ -689,6 +735,7 @@ cmd_edit() {
 
 # ======================= CMD: export ==========================
 cmd_export() {
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage_export; exit 0; }
   ensure_config
 
   local outfile="${1:-}"
@@ -709,6 +756,7 @@ cmd_export() {
 # ======================= CMD: import ==========================
 cmd_import() {
   [[ $# -eq 0 ]] && { usage_import; exit 0; }
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage_import; exit 0; }
   local infile="$1"
 
   [[ -f "$infile" ]] || { err "Archivo no encontrado: ${BOLD}${infile}${RST}"; exit 1; }
@@ -750,6 +798,7 @@ cmd_import() {
 # ======================= CMD: search ==========================
 cmd_search() {
   [[ $# -eq 0 ]] && { usage_search; exit 0; }
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage_search; exit 0; }
 
   local query="$1"; shift
   local timeout=10 verbose=0 filter_type="" filter_status=""
@@ -1801,8 +1850,8 @@ main() {
   add)                      cmd_add          "$@" ;;
   remove|rm|delete)         cmd_remove       "$@" ;;
   edit)                     cmd_edit         "$@" ;;
-  list|ls)                  cmd_list ;;
-  export)                   cmd_export       "${1:-}" ;;
+  list|ls)                  cmd_list         "$@" ;;
+  export)                   cmd_export       "$@" ;;
   import)                   cmd_import       "$@" ;;
   version|-V|--version)     printf "pvesearchin v%s\n" "$VERSION"; exit 0 ;;
   -h|--help)                banner; echo; usage_main; exit 0 ;;
@@ -1817,16 +1866,10 @@ main() {
         check-access|ssh-check) banner; echo; usage_check_access; exit 0 ;;
         update)                 banner; echo; usage_update;       exit 0 ;;
         add)                    banner; echo; usage_add;          exit 0 ;;
-        remove|rm|delete)
-          printf "\n${BOLD}Uso:${RST}\n  pvesearchin remove <hostname>\n\n"
-          printf "Elimina un servidor del listado configurado.\n\n"; exit 0 ;;
-        edit)                   banner; echo; usage_edit;         exit 0 ;;
-        list|ls)
-          printf "\n${BOLD}Uso:${RST}\n  pvesearchin list\n\n"
-          printf "Muestra todos los servidores Proxmox configurados.\n\n"; exit 0 ;;
-        export)
-          printf "\n${BOLD}Uso:${RST}\n  pvesearchin export [archivo]\n\n"
-          printf "Sin archivo imprime en stdout. Con archivo guarda el listado.\n\n"; exit 0 ;;
+        remove|rm|delete)       banner; echo; usage_remove;        exit 0 ;;
+        edit)                   banner; echo; usage_edit;          exit 0 ;;
+        list|ls)                banner; echo; usage_list;          exit 0 ;;
+        export)                 banner; echo; usage_export;        exit 0 ;;
         import)                 banner; echo; usage_import;       exit 0 ;;
         version)
           printf "\n${BOLD}Uso:${RST}\n  pvesearchin version\n\n"
