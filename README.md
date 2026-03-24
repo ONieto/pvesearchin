@@ -8,7 +8,7 @@
 | |_) \ V /  __/\__ \ (_| | | | (__| | | | | | | |
 | .__/ \_/ \___||___/\__,_|_|  \___|_| |_|_|_| |_|
 |_|
-       Proxmox VM/CT Search — v1.2.0
+       Proxmox VM/CT Search — v1.3.0
 ```
 
 ---
@@ -21,6 +21,7 @@
 | `nodes` | Inventario completo de todos los nodos (con filtros) |
 | `status` | Resumen de CPU, RAM, disco y versión PVE por nodo |
 | `orphans` | Detecta VMs/CTs apagadas sin cambios en N días |
+| `backups` | Resumen de respaldos por VM/CT con fecha, antigüedad y estado |
 | `check-access` | Verifica conectividad SSH y muestra la llave usada por nodo |
 | Gestión de servidores | `add`, `remove`, `edit`, `list`, `export`, `import` |
 | Ayuda por subcomando | `pvesearchin help <cmd>` o `pvesearchin <cmd> --help` |
@@ -212,6 +213,52 @@ pvesearchin orphans pve2.empresa.com --days 7
 
 ---
 
+### Resumen de respaldos — `backups`
+
+Muestra el estado de respaldos de todas las VMs y CTs, revisando todos los almacenamientos conectados al nodo Proxmox.
+
+```bash
+pvesearchin backups                              # todos los nodos
+pvesearchin backups pve1.empresa.com             # un nodo específico
+pvesearchin backups --unbacked                   # sólo sin respaldo
+pvesearchin backups --backed                     # sólo con respaldo
+pvesearchin backups --backed --days 7            # respaldo reciente = menos de 7 días
+pvesearchin backups pve2.empresa.com --days 14
+```
+
+| Opción | Descripción |
+|---|---|
+| `[host]` | Hostname de un nodo específico (primer argumento, opcional) |
+| `--backed` | Mostrar sólo VMs/CTs con al menos un respaldo |
+| `--unbacked` | Mostrar sólo VMs/CTs sin ningún respaldo |
+| `-d, --days N` | Días máximos para considerar un respaldo reciente (default: 30) |
+| `-t, --timeout SEC` | Timeout SSH |
+| `-v, --verbose` | Detalles de conexión |
+
+**Estados en la columna ESTADO:**
+
+| Estado | Significado |
+|---|---|
+| `✔ reciente` | El último respaldo tiene menos de N días (`--days`) |
+| `⚠ antiguo` | El último respaldo supera el umbral de días |
+| `✖ sin respaldo` | No se encontró ningún respaldo para esa VM/CT |
+
+**Ejemplo de salida:**
+```
+ 💾 Resumen de respaldos
+────────────────────────────────────────────────────────────────────────
+ ✔ 4 VM(s)/CT(s)
+
+   SERVIDOR           VMID  NOMBRE    TIPO  ÚLTIMO RESPALDO    ANTIGÜEDAD  ESTADO
+   ─────────────────  ────  ────────  ────  ─────────────────  ──────────  ──────────────
+   pve1.empresa.com   101   web-prod  VM    2026-03-20 03:00   4d          ✔ reciente
+   pve1.empresa.com   102   db-main   CT    2026-01-10 03:00   73d         ⚠ antiguo
+   pve1.empresa.com   103   nginx     VM    —                  —           ✖ sin respaldo
+   pve2.empresa.com   201   mysql     VM    2026-03-22 02:00   2d          ✔ reciente
+```
+
+---
+
 ### Verificar acceso SSH — `check-access`
 
 Prueba la conectividad SSH a cada servidor configurado y muestra el estado, la versión de PVE y la llave SSH utilizada.
@@ -337,6 +384,7 @@ hostname:puerto:usuario
 | `pvesearchin nodes [host] [--type] [--status] [--names]` | Inventario de VMs/CTs |
 | `pvesearchin status [host]` | Resumen CPU/RAM/disco por nodo |
 | `pvesearchin orphans [host] [--days N]` | Detectar VMs/CTs abandonadas |
+| `pvesearchin backups [host] [--backed\|--unbacked] [--days N]` | Resumen de respaldos |
 | `pvesearchin check-access` | Verificar acceso SSH a todos los nodos |
 | `pvesearchin add <host> [-u USER] [-p PORT]` | Agregar servidor |
 | `pvesearchin remove <host>` | Eliminar servidor |
