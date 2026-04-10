@@ -18,7 +18,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ======================= CONSTANTES GLOBALES ==========================
-readonly VERSION="1.3.1"
+readonly VERSION="1.3.2"
 readonly CONFIG_DIR="${HOME}/.config/pvesearchin"
 readonly CONFIG_FILE="${CONFIG_DIR}/servers"
 readonly DEFAULT_USER="root"
@@ -57,10 +57,10 @@ err()  { printf "%b\n" " ${RED}✖${RST} $*" >&2; }
 banner() {
   printf "%b" "${BOLD}"
   cat <<'ASCII'
- _ ____   _____  ___  __ _ _ __ ___| |__ (_)_ __
-| '_ \ \ / / _ \/ __|/ _` | '__/ __| '_ \| | '_ \
-| |_) \ V /  __/\__ \ (_| | | | (__| | | | | | | |
-| .__/ \_/ \___||___/\__,_|_|  \___|_| |_|_|_| |_|
+ _ ____   _____  ___  ___  __ _ _ __ ___| |__ (_)_ __
+| '_ \ \ / / _ \/ __|/ _ \/ _` | '__/ __| '_ \| | '_ \
+| |_) \ V /  __/\__ \  __/ (_| | | | (__| | | | | | | |
+| .__/ \_/ \___||___/\___|\__,_|_|  \___|_| |_|_|_| |_|
 |_|
 ASCII
   printf "%b" "${RST}"
@@ -208,7 +208,7 @@ render_vmct_table() {
     case "${G_TYPE[$i]}" in VM) t_color="${CYN}" ;; CT) t_color="${BLU}" ;; esac
 
     local s_color=""
-    case "${G_STATUS[$i],,}" in
+    case "$(tr '[:upper:]' '[:lower:]' <<< "${G_STATUS[$i]}")" in
       running) s_color="${GRN}" ;;
       stopped) s_color="${YLW}" ;;
       *)       s_color="${DIM}" ;;
@@ -815,8 +815,8 @@ cmd_search() {
   done
 
   # Validar filtros
-  filter_type="${filter_type,,}"
-  filter_status="${filter_status,,}"
+  filter_type="$(tr '[:upper:]' '[:lower:]' <<< "$filter_type")"
+  filter_status="$(tr '[:upper:]' '[:lower:]' <<< "$filter_status")"
   case "$filter_type" in vm|ct|"") : ;; *) err "--type debe ser vm o ct"; exit 2 ;; esac
   case "$filter_status" in running|stopped|"") : ;; *) err "--status debe ser running o stopped"; exit 2 ;; esac
 
@@ -916,8 +916,8 @@ cmd_nodes() {
     esac
   done
 
-  filter_type="${filter_type,,}"
-  filter_status="${filter_status,,}"
+  filter_type="$(tr '[:upper:]' '[:lower:]' <<< "$filter_type")"
+  filter_status="$(tr '[:upper:]' '[:lower:]' <<< "$filter_status")"
   case "$filter_type" in vm|ct|"") : ;; *) err "--type debe ser vm o ct"; exit 2 ;; esac
   case "$filter_status" in running|stopped|"") : ;; *) err "--status debe ser running o stopped"; exit 2 ;; esac
 
