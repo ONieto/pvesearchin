@@ -18,7 +18,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ======================= CONSTANTES GLOBALES ==========================
-readonly VERSION="1.3.3"
+readonly VERSION="1.3.4"
 readonly CONFIG_DIR="${HOME}/.config/pvesearchin"
 readonly CONFIG_FILE="${CONFIG_DIR}/servers"
 readonly DEFAULT_USER="root"
@@ -269,7 +269,7 @@ run_remote_collect() {
       printf "   ${DIM}[%d/%d] %s${RST}\n" "$idx" "$total" "$srv_h"
     fi
 
-    if ! ssh "${SSH_OPTS[@]}" -p "$srv_p" "${srv_u}@${srv_h}" true 2>/dev/null; then
+    if ! ssh "${SSH_OPTS[@]}" -n -p "$srv_p" "${srv_u}@${srv_h}" true 2>/dev/null; then
       warn "Sin respuesta: ${BOLD}${srv_h}${RST}:${srv_p}"
       FAILED+=("$srv_h")
       continue
@@ -1067,7 +1067,7 @@ cmd_status() {
       printf "   ${DIM}[%d/%d] %s${RST}\n" "$idx" "$total" "$srv_h"
     fi
 
-    if ! ssh "${SSH_OPTS[@]}" -p "$srv_p" "${srv_u}@${srv_h}" true 2>/dev/null; then
+    if ! ssh "${SSH_OPTS[@]}" -n -p "$srv_p" "${srv_u}@${srv_h}" true 2>/dev/null; then
       warn "Sin respuesta: ${BOLD}${srv_h}${RST}"
       FAILED_ST+=("$srv_h")
       continue
@@ -1326,7 +1326,7 @@ cmd_check_access() {
 
     local pve_ver="N/D" status_str="" key_info=""
 
-    if ssh "${SSH_OPTS[@]}" -p "$srv_p" "${srv_u}@${srv_h}" true 2>/dev/null; then
+    if ssh "${SSH_OPTS[@]}" -n -p "$srv_p" "${srv_u}@${srv_h}" true 2>/dev/null; then
       pve_ver="$(ssh "${SSH_OPTS[@]}" -p "$srv_p" "${srv_u}@${srv_h}" \
         "pveversion 2>/dev/null | awk '{print \$2}' | head -1 || echo 'N/D'" 2>/dev/null || echo 'N/D')"
       # Detectar qué llave fue usada (ssh -v filtra la llave aceptada)
@@ -1466,7 +1466,7 @@ cmd_backups() {
       printf "   ${DIM}[%d/%d] %s${RST}\n" "$idx" "$total" "$srv_h"
     fi
 
-    if ! ssh "${SSH_OPTS[@]}" -p "$srv_p" "${srv_u}@${srv_h}" true 2>/dev/null; then
+    if ! ssh "${SSH_OPTS[@]}" -n -p "$srv_p" "${srv_u}@${srv_h}" true 2>/dev/null; then
       warn "Sin respuesta: ${BOLD}${srv_h}${RST}:${srv_p}"
       FAILED_BK+=("$srv_h")
       continue
