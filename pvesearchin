@@ -18,7 +18,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ======================= CONSTANTES GLOBALES ==========================
-readonly VERSION="1.3.4"
+readonly VERSION="1.3.5"
 readonly CONFIG_DIR="${HOME}/.config/pvesearchin"
 readonly CONFIG_FILE="${CONFIG_DIR}/servers"
 readonly DEFAULT_USER="root"
@@ -1450,6 +1450,7 @@ cmd_backups() {
   declare -a BK_TYPE=()
   declare -a BK_DATE=()
   declare -a BK_AGE=()
+  declare -a BK_STORAGE=()
 
   local idx=0
   while IFS= read -r entry; do
@@ -1492,22 +1493,22 @@ for st in $(pvesm status --content backup 2>/dev/null | awk 'NR>1 {print $1}'); 
     hr=$(printf '%s' "$datepart" | cut -c12-13)
     mn=$(printf '%s' "$datepart" | cut -c15-16)
     epoch=$(date -d "${yr}-${mo}-${dy} ${hr}:${mn}:00" +%s 2>/dev/null || echo 0)
-    [ "$epoch" -gt 0 ] && printf '%s %s\n' "$vmid" "$epoch"
+    [ "$epoch" -gt 0 ] && printf '%s %s %s\n' "$vmid" "$epoch" "$st"
   done
-done | sort -k1,1 -k2,2rn | awk '!seen[$1]++ {print $1, $2}' > "$tmpbk"
+done | sort -k1,1 -k2,2rn | awk '!seen[$1]++ {print $1, $2, $3}' > "$tmpbk"
 
 NOW=$(date +%s)
 
 process_guest() {
   local vmid="$1" name="$2" type="$3"
-  local epoch age_days bkdate
-  epoch=$(awk -v id="$vmid" '$1==id {print $2; exit}' "$tmpbk")
+  local epoch storage age_days bkdate
+  read -r epoch storage <<< "$(awk -v id="$vmid" '$1==id {print $2, $3; exit}' "$tmpbk")"
   if [ -n "$epoch" ] && [ "$epoch" -gt 0 ]; then
     age_days=$(( (NOW - epoch) / 86400 ))
     bkdate=$(date -d "@$epoch" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')
-    printf '%s|%s|%s|%s|%s\n' "$vmid" "$name" "$type" "$bkdate" "$age_days"
+    printf '%s|%s|%s|%s|%s|%s\n' "$vmid" "$name" "$type" "$bkdate" "$age_days" "$storage"
   else
-    printf '%s|%s|%s||\n' "$vmid" "$name" "$type"
+    printf '%s|%s|%s|||\n' "$vmid" "$name" "$type"
   fi
 }
 
@@ -1527,7 +1528,7 @@ REMOTEBK
     )" || true
 
     if [[ -n "$raw" ]]; then
-      while IFS='|' read -r vmid name type bkdate age; do
+      while IFS='|' read -r vmid name type bkdate age storage; do
         [[ -z "$vmid" ]] && continue
         BK_SERVER+=("$srv_h")
         BK_VMID+=("$vmid")
@@ -1535,6 +1536,7 @@ REMOTEBK
         BK_TYPE+=("$type")
         BK_DATE+=("$bkdate")
         BK_AGE+=("$age")
+        BK_STORAGE+=("$storage")
       done <<< "$raw"
     fi
   done <<< "$entries_blob"
@@ -1543,7 +1545,7 @@ REMOTEBK
   hr
 
   # Aplicar filtros y calcular ESTADO
-  local -a F_SERVER=() F_VMID=() F_NAME=() F_TYPE=() F_DATE=() F_AGE_STR=() F_ESTADO=()
+  local -a F_SERVER=() F_VMID=() F_NAME=() F_TYPE=() F_DATE=() F_AGE_STR=() F_ESTADO=() F_STORAGE=()
 
   for i in "${!BK_VMID[@]}"; do
     local age="${BK_AGE[$i]}"
@@ -1571,6 +1573,7 @@ REMOTEBK
     F_DATE+=("${BK_DATE[$i]:-—}")
     F_AGE_STR+=("$age_str")
     F_ESTADO+=("$estado")
+    F_STORAGE+=("${BK_STORAGE[$i]:-—}")
   done
 
   local found=${#F_VMID[@]}
@@ -1591,7 +1594,7 @@ REMOTEBK
     fi
     echo
 
-    local W_SRV=8 W_VMID=4 W_NAME=6 W_TYPE=4 W_DATE=15 W_AGE=10 W_EST=6
+    local W_SRV=8 W_VMID=4 W_NAME=6 W_TYPE=4 W_DATE=15 W_AGE=10 W_EST=6 W_STG=7
     for i in "${!F_VMID[@]}"; do
       [[ ${#F_SERVER[$i]}  -gt $W_SRV  ]] && W_SRV=${#F_SERVER[$i]}
       [[ ${#F_VMID[$i]}    -gt $W_VMID ]] && W_VMID=${#F_VMID[$i]}
@@ -1600,6 +1603,7 @@ REMOTEBK
       [[ ${#F_DATE[$i]}    -gt $W_DATE ]] && W_DATE=${#F_DATE[$i]}
       [[ ${#F_AGE_STR[$i]} -gt $W_AGE  ]] && W_AGE=${#F_AGE_STR[$i]}
       [[ ${#F_ESTADO[$i]}  -gt $W_EST  ]] && W_EST=${#F_ESTADO[$i]}
+      [[ ${#F_STORAGE[$i]} -gt $W_STG  ]] && W_STG=${#F_STORAGE[$i]}
     done
 
     local sep_srv;  sep_srv="$(printf  '─%.0s' $(seq 1 $W_SRV))"
@@ -1609,11 +1613,12 @@ REMOTEBK
     local sep_date; sep_date="$(printf '─%.0s' $(seq 1 $W_DATE))"
     local sep_age;  sep_age="$(printf  '─%.0s' $(seq 1 $W_AGE))"
     local sep_est;  sep_est="$(printf  '─%.0s' $(seq 1 $W_EST))"
+    local sep_stg;  sep_stg="$(printf  '─%.0s' $(seq 1 $W_STG))"
 
-    printf "   %b%-${W_SRV}s  %-${W_VMID}s  %-${W_NAME}s  %-${W_TYPE}s  %-${W_DATE}s  %-${W_AGE}s  %-${W_EST}s%b\n" \
-      "${BOLD}" "SERVIDOR" "VMID" "NOMBRE" "TIPO" "ÚLTIMO RESPALDO" "ANTIGÜEDAD" "ESTADO" "${RST}"
-    printf "   ${DIM}%s  %s  %s  %s  %s  %s  %s${RST}\n" \
-      "$sep_srv" "$sep_vmid" "$sep_name" "$sep_type" "$sep_date" "$sep_age" "$sep_est"
+    printf "   %b%-${W_SRV}s  %-${W_VMID}s  %-${W_NAME}s  %-${W_TYPE}s  %-${W_DATE}s  %-${W_AGE}s  %-${W_STG}s  %-${W_EST}s%b\n" \
+      "${BOLD}" "SERVIDOR" "VMID" "NOMBRE" "TIPO" "ÚLTIMO RESPALDO" "ANTIGÜEDAD" "STORAGE" "ESTADO" "${RST}"
+    printf "   ${DIM}%s  %s  %s  %s  %s  %s  %s  %s${RST}\n" \
+      "$sep_srv" "$sep_vmid" "$sep_name" "$sep_type" "$sep_date" "$sep_age" "$sep_stg" "$sep_est"
 
     for i in "${!F_VMID[@]}"; do
       local t_color=""
@@ -1626,10 +1631,10 @@ REMOTEBK
         "✖ sin respaldo") e_color="${RED}" ;;
       esac
 
-      printf "   %-${W_SRV}s  %-${W_VMID}s  %-${W_NAME}s  %b%-${W_TYPE}s%b  %-${W_DATE}s  %-${W_AGE}s  %b%-${W_EST}s%b\n" \
+      printf "   %-${W_SRV}s  %-${W_VMID}s  %-${W_NAME}s  %b%-${W_TYPE}s%b  %-${W_DATE}s  %-${W_AGE}s  %-${W_STG}s  %b%-${W_EST}s%b\n" \
         "${F_SERVER[$i]}" "${F_VMID[$i]}" "${F_NAME[$i]}" \
         "${t_color}" "${F_TYPE[$i]}" "${RST}" \
-        "${F_DATE[$i]}" "${F_AGE_STR[$i]}" \
+        "${F_DATE[$i]}" "${F_AGE_STR[$i]}" "${F_STORAGE[$i]}" \
         "${e_color}" "${F_ESTADO[$i]}" "${RST}"
     done
   fi

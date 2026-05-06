@@ -8,7 +8,7 @@
 | |_) \ V /  __/\__ \  __/ (_| | | | (__| | | | | | | |
 | .__/ \_/ \___||___/\___|\__,_|_|  \___|_| |_|_|_| |_|
 |_|
-       Proxmox VM/CT Search — v1.3.4
+       Proxmox VM/CT Search — v1.3.5
 ```
 
 ---
@@ -249,12 +249,12 @@ pvesearchin backups pve2.empresa.com --days 14
 ────────────────────────────────────────────────────────────────────────
  ✔ 4 VM(s)/CT(s)
 
-   SERVIDOR           VMID  NOMBRE    TIPO  ÚLTIMO RESPALDO    ANTIGÜEDAD  ESTADO
-   ─────────────────  ────  ────────  ────  ─────────────────  ──────────  ──────────────
-   pve1.empresa.com   101   web-prod  VM    2026-03-20 03:00   4d          ✔ reciente
-   pve1.empresa.com   102   db-main   CT    2026-01-10 03:00   73d         ⚠ antiguo
-   pve1.empresa.com   103   nginx     VM    —                  —           ✖ sin respaldo
-   pve2.empresa.com   201   mysql     VM    2026-03-22 02:00   2d          ✔ reciente
+   SERVIDOR           VMID  NOMBRE    TIPO  ÚLTIMO RESPALDO    ANTIGÜEDAD  STORAGE   ESTADO
+   ─────────────────  ────  ────────  ────  ─────────────────  ──────────  ────────  ──────────────
+   pve1.empresa.com   101   web-prod  VM    2026-03-20 03:00   4d          backup1   ✔ reciente
+   pve1.empresa.com   102   db-main   CT    2026-01-10 03:00   73d         nfs-bk    ⚠ antiguo
+   pve1.empresa.com   103   nginx     VM    —                  —           —         ✖ sin respaldo
+   pve2.empresa.com   201   mysql     VM    2026-03-22 02:00   2d          local     ✔ reciente
 ```
 
 ---
