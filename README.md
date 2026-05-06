@@ -21,7 +21,7 @@
 | `nodes` | Inventario completo de todos los nodos (con filtros) |
 | `status` | Resumen de CPU, RAM, disco y versión PVE por nodo |
 | `orphans` | Detecta VMs/CTs apagadas sin cambios en N días |
-| `backups` | Resumen de respaldos por VM/CT con fecha, antigüedad y estado |
+| `backups` | Resumen de respaldos por VM/CT con fecha, antigüedad, storage y estado |
 | `check-access` | Verifica conectividad SSH y muestra la llave usada por nodo |
 | Gestión de servidores | `add`, `remove`, `edit`, `list`, `export`, `import` |
 | Ayuda por subcomando | `pvesearchin help <cmd>` o `pvesearchin <cmd> --help` |
@@ -215,7 +215,7 @@ pvesearchin orphans pve2.empresa.com --days 7
 
 ### Resumen de respaldos — `backups`
 
-Muestra el estado de respaldos de todas las VMs y CTs, revisando todos los almacenamientos conectados al nodo Proxmox.
+Muestra el estado de respaldos de todas las VMs y CTs, revisando todos los almacenamientos conectados al nodo Proxmox. Incluye la fecha, antigüedad, estado y el storage donde se encuentra el respaldo más reciente.
 
 ```bash
 pvesearchin backups                              # todos los nodos
